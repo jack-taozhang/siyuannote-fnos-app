@@ -1,0 +1,16 @@
+{
+  "name": "siyuan-localfs",
+  "version": "1.12.11",
+  "description": "在思源笔记里浏览「跑着思源的那台机器」上的全部存储空间：侧边栏文件树、内置 DWG/DXF 预览、Office 在线预览与编辑",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "node tools/build.js",
+    "build:repo": "node tools/build.js --repo",
+    "pack": "node tools/pack.js --rebuild",
+    "pack:only": "node tools/pack.js",
+    "check": "node tools/build.js --repo"
+  },
+  "author": "zhangtao",
+  "license": "MIT"
+}

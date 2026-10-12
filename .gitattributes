@@ -1,0 +1,24 @@
+# 默认按文本入库，检出时转 CRLF（Windows 开发环境）
+* text=auto eol=crlf
+
+# 二进制产物不做行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.wasm  binary
+*.fpk   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.mp4   binary
+*.mp3   binary
+*.pdf   binary
+
+# 明确按 LF 处理的脚本（NAS 上直接跑，CRLF 会让 shebang 失效）
+*.sh    text eol=lf
+
+# 思源插件的 index.js / index.css 由构建产出，不做行尾转换（逐字节可复现）
+/index.js  -text
+/index.css -text

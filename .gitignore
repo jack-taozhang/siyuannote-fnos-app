@@ -1,0 +1,48 @@
+# 依赖
+node_modules/
+
+# 构建产物（dist/ 是留档用的，dist-package/ 是可安装的包）
+dist/
+dist-package/
+release/
+
+# vendor/ = 早期内置的 CAD 查看器副本（22MB）。src 里已无任何引用，
+# CAD 预览 2026-10-10 起改走飞牛原生「CAD 看图」应用 ⇒ 这份是废弃残留，不入库。
+vendor/
+
+# ★ 口令 / 凭据一律不进版本库 ★
+tools/.nb-local.json
+.gh-token
+.gh-cred.py
+.env
+.env.local
+*.secret
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# ★ 验证产物（.verify/ 里含真实 NAS 凭据与 Chrome 配置，绝不可入库）★
+.verify/
+.verify/chrome-prof*/
+
+# ★ 工作区记忆（.workbuddy/memory/*.md 里可能含真实 NAS 口令与 token）★
+.workbuddy/
+
+# 临时/调试产物
+.scratch/
+*.log
+*.tmp
+*.fpk
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Python 编译产物
+__pycache__/
+*.pyc
+*.pyo
