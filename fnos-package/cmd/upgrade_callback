@@ -1,0 +1,46 @@
+#!/bin/bash
+#
+# 升级完成后：如果升级前应用是运行中的，就把它按原状态拉起来。
+#
+# 启动方式统一交给 cmd/main —— 各处自己拼一遍启动命令，
+# 很容易出现"某条路径忘了 nohup，升级完应用就变已停用"这类问题。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+FLAG_FILE="${PKGVAR}/.was_running"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [upgrade_callback] $1" >> "${PKGVAR}/app.log"
+}
+
+mkdir -p "$PKGVAR" 2>/dev/null
+
+# 同上：cmd/ 在 /var/apps/<app>/cmd/，不在 TRIM_APPDEST 下
+MAIN=""
+for cand in "${TRIM_APPDEST}/cmd/main" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/main"; do
+  if [ -x "$cand" ]; then MAIN="$cand"; break; fi
+done
+
+if [ -f "$FLAG_FILE" ]; then
+  if [ -x "$MAIN" ]; then
+    # 升级期间应用中心可能已经启动过它，先停掉避免端口占用，再按原状态拉起
+    "$MAIN" stop >> "${PKGVAR}/app.log" 2>&1
+    if "$MAIN" start >> "${PKGVAR}/app.log" 2>&1; then
+      log_msg "升级后已重启（cmd/main）"
+      rm -f "$FLAG_FILE"
+      log_msg "升级完成：${TRIM_OLD_APPVER:-?} → ${TRIM_APPVER:-?}"
+      exit 0
+    fi
+    log_msg "升级后重启失败，请查看日志 ${PKGVAR}/app.log"
+    echo "思源笔记升级后启动失败，请查看日志 ${PKGVAR}/app.log" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    rm -f "$FLAG_FILE"
+    exit 1
+  fi
+
+  log_msg "未找到 $MAIN，跳过自动重启"
+  rm -f "$FLAG_FILE"
+else
+  log_msg "升级完成（升级前服务未运行，保持停止状态）"
+fi
+
+log_msg "升级完成：${TRIM_OLD_APPVER:-?} → ${TRIM_APPVER:-?}"
+exit 0
