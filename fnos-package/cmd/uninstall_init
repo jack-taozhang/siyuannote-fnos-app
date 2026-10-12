@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# 卸载前：先把正在运行的服务停掉。
+#
+# 不停的话，卸载时删除应用文件会遇到"文件被占用"，
+# 而且残留进程会继续占着 6806，导致下次安装失败。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+PID_FILE="${PKGVAR}/app.pid"
+PROXY_PID_FILE="${PKGVAR}/proxy.pid"
+LOCAL_FS_PID_FILE="${PKGVAR}/local-fs.pid"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [uninstall_init] $1" >> "${PKGVAR}/app.log"
+}
+
+check_process() {
+  kill -0 "$1" 2>/dev/null
+}
+
+mkdir -p "$PKGVAR" 2>/dev/null
+
+# 先停本机文件服务：它是「本机存储」的数据面，也占着 8021，
+# 卸载后残留会挡住下次安装。
+if [ -f "$LOCAL_FS_PID_FILE" ]; then
+  pid="$(head -n 1 "$LOCAL_FS_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    log_msg "停止本机文件服务，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+    count=0
+    while check_process "$pid" && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_process "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$LOCAL_FS_PID_FILE"
+fi
+
+stray_lfs="$(pgrep -f 'local-fs.py' 2>/dev/null | head -n 1)"
+if [ -n "$stray_lfs" ]; then
+  log_msg "清理残留本机文件服务，pid=${stray_lfs}"
+  kill -TERM "$stray_lfs" 2>/dev/null
+fi
+
+# 先停反向代理：它是对外入口，先断开，内核就不再接新请求
+if [ -f "$PROXY_PID_FILE" ]; then
+  pid="$(head -n 1 "$PROXY_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    log_msg "停止反向代理，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+    count=0
+    while check_process "$pid" && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_process "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$PROXY_PID_FILE"
+fi
+
+# PID 文件丢了也要收干净：按 cmdline 找残留代理
+stray="$(pgrep -f 'reverse-proxy.py' 2>/dev/null | head -n 1)"
+if [ -n "$stray" ]; then
+  log_msg "清理残留反向代理，pid=${stray}"
+  kill -TERM "$stray" 2>/dev/null
+fi
+
+if [ -f "$PID_FILE" ]; then
+  pid="$(head -n 1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    log_msg "停止服务，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+
+    # 与 cmd/main 一致：给思源 30 秒把数据落盘。
+    # 卸载时更要耐心 —— 这时候打断，用户的笔记可能正在写事务。
+    count=0
+    while check_process "$pid" && [ "$count" -lt 30 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+
+    if check_process "$pid"; then
+      log_msg "进程未响应 TERM，改用 KILL"
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  fi
+  rm -f "$PID_FILE"
+fi
+
+log_msg "服务已停止，可以安全卸载。"
+exit 0
