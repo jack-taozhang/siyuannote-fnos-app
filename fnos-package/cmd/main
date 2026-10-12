@@ -1,0 +1,820 @@
+#!/bin/bash
+#
+# 思源笔记（飞牛原生应用）· 生命周期脚本
+#
+#   用法：main start | stop | status
+#
+# ── 这个应用由三个进程组成 ──────────────────────────────────────
+#   ① 反向代理  app/reverse-proxy.py  —— 监听 manifest 的 service_port（6806），
+#      对外唯一入口。它除了把请求头 Origin 的 host 改写成与 Host 一致，
+#      还兼职**同源通道**的分流：
+#         /                   → 思源内核（下面 ②）
+#         /localfs/*          → 本机文件服务（下面 ③）
+#         /localfs/oo-srv/*   → OnlyOffice 文档服务（剥前缀）
+#         /localfs/fv/*       → 文件预览 fnos-file-viewer :8030（剥前缀）
+#         /localfs/cad/*      → CAD 看图 fnos-dwg-viewer :8020（剥前缀 + 正文改写）
+#         /localfs/docs/*     → 飞牛官方「Office文档」trim.docs :5666（剥 /localfs；
+#                               另外收编 /docs、/onlyoffice 两个根绝对命名空间，
+#                               并在请求没带飞牛登录态时补上本机保存的凭据）
+#      后三条是为了手机走外网穿透（只映射了这一个端口）时也能用。
+#   ② 思源内核  app/kernel-dist/kernel —— 退到内网端口（默认 16806），
+#      只接受本机反代的连接。
+#   ③ 本机文件服务  app/local-fs.py —— 监听 8021，以 root 直读全部存储空间
+#      （/vol1、/vol00…），给思源插件提供「本机存储」的数据面，以及
+#      Office 在线预览/编辑的页面（复用 NAS 上的 OnlyOffice）。
+#      ★ 它**自己不渲染任何图纸**：CAD/DXF 交给飞牛原生「CAD 看图」应用，
+#        其余格式交给飞牛原生「文件预览」应用（都经上面的同源通道）。
+#
+#   status 三个都在跑才算「运行中」—— 少一个应用就不可用，
+#   这时候显示成"运行中"只会让人对着打不开的页面发呆。
+#
+# ── 与「CAD 看图」那个包的三个结构差异 ──────────────────────────
+#  ① 内核是**官方 Go 程序**，不会自己写 PID 文件 ⇒ 多一层 app/launch-kernel.sh
+#     负责"先落 PID、再 exec 成内核"（exec 保留 PID）。
+#  ② 内核不在 TRIM_APPDEST/server 而在 TRIM_APPDEST/kernel-dist（要与
+#     stage/ 、appearance/ 同级，内核才找得到前端资源）。
+#  ③ 端口可能被旧的 Docker 容器占着（思源以前就是那么跑的）⇒ 启动前专门
+#     检查端口，报一条**能照着做**的错误，而不是让人对着"已停用"发呆。
+#
+# ── 一个只在「手动安装 root 型 FPK」时才暴露的坑（已内置自愈）─────
+#   应用中心给这类安装记下的安装位置自相矛盾：payload 在 /usr/local/apps，
+#   install_volume_id 却是 1 ⇒ 启动时传进来的 TRIM_APPDEST 根本不存在。
+#   详见上面的 resolve_appdest()：按"哪份目录里真有内核"来定。
+#
+# 关于日志与状态：
+#   · 日志 ${TRIM_PKGVAR}/app.log；启动失败原因同时写 $TRIM_TEMP_LOGFILE，
+#     应用中心会把它显示出来。
+#   · status：运行中 exit 0，未运行 exit 3 —— 写错应用中心就显示错状态。
+
+set -u
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ── 应用目录解析：按"哪个目录里真的有内核"来定，不盲信环境变量 ──────
+# 飞牛应用中心把安装位置记在数据库里，启动时据此拼环境变量传进来：
+#   install_volume_id=0 ⇒ /usr/local/apps/@appcenter/<app>
+#   install_volume_id=N ⇒ /vol{N}/@appcenter/<app>
+# 但「手动安装 FPK」的 **root 型**包（config/privilege 里 run-as: root）
+# 会留下一条自相矛盾的记录：payload 实际落在 /usr/local/apps/@appcenter/<app>，
+# install_volume_id 却仍是所选存储空间的编号（本机是 1）⇒ 传进来的
+# TRIM_APPDEST 指向一个**并不存在**的目录，启动就被判「内核不存在或不可执行」。
+#   实证：本机 app 表 install_type=root、install_volume_id=1；
+#         error.log 2026-10-09T18:50:37 报的正是
+#         /vol1/@appcenter/siyuannote/kernel-dist/kernel
+# 所以这里按顺序找，谁身上真有 kernel-dist/kernel 就用谁：
+#   ① 应用中心传的 TRIM_APPDEST / TRIM_APPDEST_VOL
+#      （正常安装时命中①，行为与以前完全一样）
+#   ② 注册目录的 target 软链（/var/apps/<app>/target，应用中心维护）
+#   ③ 系统区 /usr/local/apps/@appcenter/<app>
+#   ④ 各存储空间 /vol*/@appcenter/<app>
+resolve_appdest() {
+  local d
+  for d in ${TRIM_APPDEST:-} ${TRIM_APPDEST_VOL:-} \
+           "$(readlink -f "/var/apps/${APPNAME}/target" 2>/dev/null)" \
+           "/usr/local/apps/@appcenter/${APPNAME}" \
+           /vol*/@appcenter/"${APPNAME}"; do
+    if [ -n "$d" ] && [ -x "${d}/kernel-dist/kernel" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+APPNAME="${TRIM_APPNAME:-siyuannote}"
+PKGVAR="${TRIM_PKGVAR:-/tmp/${APPNAME}}"
+PKGETC="${TRIM_PKGETC:-${PKGVAR}}"
+
+# APPDEST_RAW 留一份原值：日志与报错要说清"应用中心传的是什么"，
+# 否则下次只会看到一句"内核不存在"，又得从头查一遍。
+APPDEST_RAW="${TRIM_APPDEST:-}"
+APPDEST="$(resolve_appdest)" || APPDEST="$APPDEST_RAW"
+[ -n "$APPDEST" ] || APPDEST="/usr/local/apps/@appcenter/${APPNAME}"
+
+# PORT        对外端口（manifest 的 service_port）—— 由反向代理持有
+# INTERNAL_PORT 内核内网端口 —— 只有本机反代能连
+PORT="${TRIM_SERVICE_PORT:-6806}"
+INTERNAL_PORT="${TRIM_INTERNAL_PORT:-16806}"
+
+LOG_FILE="${PKGVAR}/app.log"
+PID_FILE="${PKGVAR}/app.pid"
+PROXY_PID_FILE="${PKGVAR}/proxy.pid"
+LOCAL_FS_PID_FILE="${PKGVAR}/local-fs.pid"
+
+KERNEL_DIR="${APPDEST}/kernel-dist"
+KERNEL_BIN="${KERNEL_DIR}/kernel"
+MUSL_LOADER="${KERNEL_DIR}/ld-musl-x86_64.so.1"
+LAUNCHER="${APPDEST}/launch-kernel.sh"
+PROXY_SCRIPT="${APPDEST}/reverse-proxy.py"
+LOCAL_FS_SCRIPT="${APPDEST}/local-fs.py"
+
+# 本机文件服务端口（不是 manifest 的 service_port，那个归反代）
+LOCAL_FS_PORT="${TRIM_LOCAL_FS_PORT:-8021}"
+
+# 飞牛系统自带 python3（应用本体是 Go 二进制，这一层是唯一的外部依赖）
+PYTHON_BIN="${TRIM_PYTHON:-/usr/bin/python3}"
+
+# ── 可覆盖配置 ─────────────────────────────────────────────────
+# 改法：往 ${PKGETC}/ 下写单行文件，然后在应用中心把应用停一下再启动。
+#   workspace.path  思源工作区绝对路径（默认沿用你原来的 Docker 数据卷）
+#   authcode        访问鉴权码（默认空 → 自动沿用工作区里已有的）
+#   run-as          owner（默认，降权到工作区属主）| root（直接以 root 跑）
+#   oo-url          OnlyOffice 地址（默认 http://127.0.0.1:8082，即网盘那套）
+#   oo-secret       OnlyOffice JWT 密钥（默认沿用网盘 compose 里的那个）
+WORKSPACE_FILE="${PKGETC}/workspace.path"
+AUTHCODE_FILE="${PKGETC}/authcode"
+RUNAS_FILE="${PKGETC}/run-as"
+OO_URL_FILE="${PKGETC}/oo-url"
+OO_SECRET_FILE="${PKGETC}/oo-secret"
+
+DEFAULT_WORKSPACE="/vol1/docker/project/dk_app/siyuan/siyuan_E4Xr/data"
+DEFAULT_OO_URL="http://127.0.0.1:8082"
+DEFAULT_OO_SECRET="nebula-oo-secret-change-me"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# ── 把内核内网端口（16806）挡在防火墙后面，只留回环 ★2026-10-10 ★ ──
+#
+# 为什么要做这一步：
+#   思源内核**只有 --port，没有绑定地址参数**（真机 `kernel serve --help` 确认），
+#   而它非 RUN_IN_CONTAINER 模式只绑 127.0.0.1、进不来；设了 RUN_IN_CONTAINER
+#   就绑 **0.0.0.0**（`ss -ltn` 显示 `*:16806`）—— 于是这个"内网口"其实全网可达。
+#   后果：手机经外网穿透（FN Connect）访问时，若穿透层绕过反代 6806 直连 16806，
+#   该请求逃过了反代的 fix_origin；同时思源 3.8.4 起（修 CVE-2026-100646）
+#   IsSessionOriginAllowed() 要求 **Origin 的 host == 请求 Host**，穿透层把二者
+#   改得不一致 ⇒ 内核回 `{"code":-1,"msg":"Auth failed: invalid request origin"}`，
+#   用户"密码输错一次之后就再也进不去"。
+#
+# 做法：iptables 只放行 lo 访问 16806，其余 DROP。内核无 bind 参数时这是唯一解。
+#   · 规则插在 INPUT 最前面（本机 INPUT 策略是 ACCEPT、且紧跟一条 -j LUCKY，
+#     不插到前面会被它先放过去）。
+#   · 幂等：每次 start 先清旧的同款规则再加，重复启动不会堆积。
+#   · 尽力而为：没有 iptables 或没有权限时不阻断启动（功能优先），只记日志。
+harden_kernel_port() {
+  local p="$INTERNAL_PORT"
+  command -v iptables >/dev/null 2>&1 || { log_msg "无 iptables，跳过 ${p} 端口加固"; return 0; }
+  iptables -L INPUT -n >/dev/null 2>&1 || { log_msg "iptables 不可用（无权限？），跳过 ${p} 端口加固"; return 0; }
+
+  # 清旧规则（同名同参数，循环删干净）
+  while iptables -D INPUT -p tcp --dport "$p" -i lo -j ACCEPT 2>/dev/null; do :; done
+  while iptables -D INPUT -p tcp --dport "$p" -j DROP 2>/dev/null; do :; done
+
+  if iptables -I INPUT 1 -p tcp --dport "$p" -i lo -j ACCEPT 2>/dev/null \
+     && iptables -I INPUT 2 -p tcp --dport "$p" -j DROP 2>/dev/null; then
+    log_msg "已加固：仅允许回环访问内核端口 ${p}（其余来源 DROP）"
+  else
+    log_msg "警告：${p} 端口加固失败，内核端口可能仍对外可达"
+  fi
+  return 0
+}
+
+# 撤销加固（stop 时不必做 —— 内核都没了，端口自然不通）。
+# 留一个工具函数，供排障时 `main unhard` 手动调用。
+unharden_kernel_port() {
+  local p="$INTERNAL_PORT"
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -D INPUT -p tcp --dport "$p" -i lo -j ACCEPT 2>/dev/null; do :; done
+  while iptables -D INPUT -p tcp --dport "$p" -j DROP 2>/dev/null; do :; done
+  log_msg "已撤销内核端口 ${p} 的防火墙加固"
+  return 0
+}
+
+# 单行配置读取：空文件/只有空白 ⇒ 用默认值
+read_conf() {
+  local file="$1" def="${2:-}" v=""
+  if [ -f "$file" ]; then
+    v="$(head -n 1 "$file" 2>/dev/null | tr -d '\r' | sed -e 's/[[:space:]]*$//')"
+  fi
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
+}
+
+read_pid_file() {
+  head -n 1 "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# PID 存活校验。多一道 cmdline 核对：PID 会被系统回收，
+# 只 kill -0 的话，进程崩了之后 PID 落到别的进程上就会误判成"运行中"。
+check_pid_alive() {
+  local pid="$1" keyword="${2:-}"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$keyword" ] && [ -r "/proc/${pid}/cmdline" ]; then
+    grep -qa "$keyword" "/proc/${pid}/cmdline" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+check_process() { check_pid_alive "$1" 'kernel'; }
+kernel_running() { check_process "$(read_pid_file "$PID_FILE")"; }
+proxy_running() { check_pid_alive "$(read_pid_file "$PROXY_PID_FILE")" 'reverse-proxy'; }
+local_fs_running() { check_pid_alive "$(read_pid_file "$LOCAL_FS_PID_FILE")" 'local-fs'; }
+
+status_app() {
+  kernel_running || return 1
+  proxy_running || return 1
+  local_fs_running || return 1
+  return 0
+}
+
+port_listening() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  else
+    return 1
+  fi
+}
+
+# 端口被谁占着（尽力而为，拿不到就返回空）
+port_holder() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E "[:.]${p}\$" | head -n 1
+  fi
+}
+
+wait_pid_file() {
+  local file="$1" tries="${2:-20}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    [ -s "$file" ] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_port() {
+  local p="$1" tries="${2:-60}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    port_listening "$p" && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+workspace_owner() {
+  local o
+  o="$(stat -c '%u:%g' "$1" 2>/dev/null)"
+  if [ -n "$o" ]; then printf '%s' "$o"; else printf '1000:1001'; fi
+}
+
+fail_start() {
+  log_msg "启动失败：$1"
+  echo "思源笔记启动失败：$1" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+  return 1
+}
+
+# ── 反向代理 ───────────────────────────────────────────────────
+start_proxy() {
+  if proxy_running; then
+    return 0
+  fi
+  rm -f "$PROXY_PID_FILE" 2>/dev/null
+
+  if [ ! -f "$PROXY_SCRIPT" ]; then
+    log_msg "缺少反向代理脚本：$PROXY_SCRIPT"
+    return 1
+  fi
+
+  local py="$PYTHON_BIN"
+  if [ ! -x "$py" ]; then
+    py="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [ -z "$py" ]; then
+    log_msg "找不到 python3（应为 /usr/bin/python3），无法启动反向代理"
+    return 1
+  fi
+
+  export PROXY_LISTEN_HOST="0.0.0.0"
+  export PROXY_LISTEN_PORT="$PORT"
+  export PROXY_UPSTREAM_HOST="127.0.0.1"
+  export PROXY_UPSTREAM_PORT="$INTERNAL_PORT"
+  # 同源通道：/localfs/* 转给本机文件服务（见 reverse-proxy.py 的说明）。
+  # 手机走外网穿透时只映射了 $PORT 这一个端口，够不到 ${LOCAL_FS_PORT}，
+  # 挂到同源之后插件用「当前访问源 + /localfs」即可，三种走法通吃。
+  export PROXY_LOCAL_FS_PREFIX="/localfs"
+  export PROXY_LOCAL_FS_HOST="127.0.0.1"
+  export PROXY_LOCAL_FS_PORT="$LOCAL_FS_PORT"
+
+  # OnlyOffice 的同源通道（见 reverse-proxy.py 的 OO_PREFIX 说明）：
+  # 外网穿透只映射思源这一个端口，:8082 够不到 ⇒ 把文档服务也挂到同源下面。
+  # 端口从 oo-url 里解析（默认 oo-url 就是 127.0.0.1:8082）。
+  local oo_url_for_proxy oo_port_for_proxy
+  oo_url_for_proxy="$(read_conf "$OO_URL_FILE" "$DEFAULT_OO_URL")"
+  oo_port_for_proxy="$(printf '%s' "$oo_url_for_proxy" | sed -n 's|.*:\([0-9][0-9]*\)$|\1|p')"
+  [ -n "$oo_port_for_proxy" ] || oo_port_for_proxy="8082"
+  export PROXY_OO_PREFIX="/localfs/oo-srv"
+  export PROXY_OO_HOST="127.0.0.1"
+  export PROXY_OO_PORT="$oo_port_for_proxy"
+
+  # 文件预览（file-viewer）的同源通道（见 reverse-proxy.py 的 FV_PREFIX 说明）：
+  # 「文件预览」是另一个独立应用（fnos-file-viewer，默认 :8030）。插件把
+  # 非 CAD / 非 Office 的格式都交给它渲染 —— 手机经外网穿透时同样够不到 8030，
+  # 所以也挂到同源下面。★ 它没在跑也不影响：这条路由只是没人用（插件会给提示）。
+  export PROXY_FV_PREFIX="/localfs/fv"
+  export PROXY_FV_HOST="127.0.0.1"
+  export PROXY_FV_PORT="${TRIM_FV_PORT:-8030}"
+
+  # CAD 看图（fnos-dwg-viewer）的同源通道（见 reverse-proxy.py 的 CAD_PREFIX 说明）：
+  # 「CAD 看图」是另一个独立应用（默认 :8020），与上面「文件预览」同构 ——
+  # 插件把 .dwg/.dxf 交给它渲染。★ 与 file-viewer 的唯一差别：它写死了
+  # /assets/* 与 /api/* 这类**根绝对**引用，正好撞上思源内核的资源与接口，
+  # 所以这条通道除了剥前缀还要**改写响应正文**给它们补前缀（反代里做的）。
+  export PROXY_CAD_PREFIX="/localfs/cad"
+  export PROXY_CAD_HOST="127.0.0.1"
+  export PROXY_CAD_PORT="${TRIM_CAD_PORT:-8020}"
+
+  # 飞牛官方「Office文档」(trim.docs) 的同源通道（见 reverse-proxy.py 的 DOCS_PREFIX 说明）：
+  # 它是**直装宿主**的官方应用（不是容器）——`docs` 进程监听 127.0.0.1:10500（页面/接口）
+  # 与 10501（它自带的 OnlyOffice），外面套飞牛主 nginx 的 **:5666**。插件把
+  # Office 文档（doc/docx/xls/xlsx/ppt/pptx/odt…）交给它渲染。
+  # ★ 与上面两条的关键差别：它**要飞牛登录态**（浏览器 cookie ost/osrt，飞牛 nginx
+  #   转发给应用前改名成 fnos-token/fnos-long-token）。所以反代除了剥 /localfs 前缀、
+  #   收编 /docs 与 /onlyoffice 两个根绝对命名空间，还要在请求**没带凭据**时补上
+  #   本机保存的那份 —— 桌面思源客户端的内核在 127.0.0.1，它那侧没有 NAS 的 cookie。
+  export PROXY_DOCS_PREFIX="/localfs/docs"
+  export PROXY_DOCS_HOST="127.0.0.1"
+  export PROXY_DOCS_PORT="${TRIM_DOCS_PORT:-5666}"
+
+  # PID 由脚本自己写（setsid 可能 fork，$! 不可靠）—— 与 launch-kernel.sh 同一套路
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$py" "$PROXY_SCRIPT" "$PROXY_PID_FILE" >> "$LOG_FILE" 2>&1 < /dev/null &
+  else
+    nohup "$py" "$PROXY_SCRIPT" "$PROXY_PID_FILE" >> "$LOG_FILE" 2>&1 < /dev/null &
+  fi
+  disown 2>/dev/null || true
+
+  if ! wait_pid_file "$PROXY_PID_FILE" 20; then
+    log_msg "反向代理没有写出 PID 文件（${PROXY_PID_FILE}），请看日志"
+    return 1
+  fi
+  if ! proxy_running; then
+    log_msg "反向代理进程未能存活（多半是 ${PORT} 被占用），请看日志"
+    return 1
+  fi
+  return 0
+}
+
+stop_proxy() {
+  local pid
+  pid="$(read_pid_file "$PROXY_PID_FILE")"
+  if check_pid_alive "$pid" 'reverse-proxy'; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local count=0
+    while check_pid_alive "$pid" 'reverse-proxy' && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_pid_alive "$pid" 'reverse-proxy' && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PROXY_PID_FILE" 2>/dev/null
+  return 0
+}
+
+# 兜底：PID 文件丢了（比如手工清过）时按 cmdline 找残留代理
+#
+# ★ 必须杀**全部**匹配项，不能只杀 head -n 1 ★
+#   2026-10-09 实证：`ss -ltnp | grep -o 'pid='` 这类写法容易取错，
+#   而"只杀第一个"在下面这种情形会翻车：
+#     上次 stop 没走完 ⇒ 两个 reverse-proxy 都活着（一个占着端口、一个是僵尸），
+#     杀掉第一个之后端口仍被占 ⇒ 又报"端口被占用" ⇒ 用户以为没救了。
+#   循环杀到干净为止，再复查一次。
+kill_stray_proxy() {
+  local pid n=0
+  while [ "$n" -lt 10 ]; do
+    pid="$(_stray_pids "$PROXY_SCRIPT" | head -n 1)"
+    [ -z "$pid" ] && break
+    log_msg "回收残留反向代理 pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    check_pid_alive "$pid" 'reverse-proxy' && kill -KILL "$pid" 2>/dev/null || true
+    n=$((n + 1))
+  done
+  return 0
+}
+
+# ★ 按**脚本绝对路径**找本应用的残留进程 ★
+#
+# 为什么不用 `pgrep -f "reverse-proxy.py"` 这种只认文件名的写法：
+#   飞牛上可能同时存在别的应用（甚至别的用户装的同名脚本）——
+#   只按文件名匹配会**误杀别人的进程**。带上完整路径就精确了。
+#
+# 为什么两种路径都认：
+#   我们这套应用在磁盘上有**两份** payload（见 README 的"矛盾记录"）——
+#   `/vol1/@appcenter/siyuannote/` 与 `/usr/local/apps/@appcenter/siyuannote/`，
+#   实际跑哪份取决于应用中心的记录。两个都匹配才不会漏。
+_stray_pids() {
+  local script="$1"
+  local d1="/vol1/@appcenter/siyuannote"
+  local d2="/usr/local/apps/@appcenter/siyuannote"
+  local base
+  base="$(basename "$script")"
+  ps -eo pid,args 2>/dev/null \
+    | grep -E "python3?[^ ]* (${d1}|${d2})/${base}" \
+    | grep -v grep \
+    | awk '{print $1}'
+}
+
+# ★ 启动前的"认领"：把上一轮没退干净的三件套收回来，把端口交还 ★
+#
+# 这是用户报「停用了应用、再点击启动，服务就起不来」的**直接原因之一**：
+#   stop 之后 start 立刻跑（或 stop 半途失败）⇒ 残留进程还占着 6806/8021/16806
+#   ⇒ 端口检查失败 ⇒ 报"多半是旧的 Docker 容器还在跑"（**误导**，其实是自己）。
+#
+# 只按脚本路径精确匹配，不碰 Docker、不碰别的应用。
+reclaim_strays() {
+  local pids n
+  # reverse-proxy
+  pids="$(_stray_pids "$PROXY_SCRIPT")"
+  if [ -n "$pids" ]; then
+    log_msg "发现残留反向代理（$(echo "$pids" | tr '\n' ' ')），回收中…"
+    n=0
+    for p in $pids; do
+      kill -TERM "$p" 2>/dev/null || true
+      n=$((n + 1))
+    done
+    # 给它们一点时间优雅退出（代理有信号处理，退了就会释放 6806）
+    local count=0
+    while [ "$count" -lt 5 ]; do
+      [ -z "$(_stray_pids "$PROXY_SCRIPT")" ] && break
+      sleep 1
+      count=$((count + 1))
+    done
+    for p in $(_stray_pids "$PROXY_SCRIPT"); do
+      kill -KILL "$p" 2>/dev/null || true
+    done
+  fi
+  # local-fs
+  pids="$(_stray_pids "$LOCAL_FS_SCRIPT")"
+  if [ -n "$pids" ]; then
+    log_msg "发现残留本机文件服务（$(echo "$pids" | tr '\n' ' ')），回收中…"
+    for p in $pids; do
+      kill -TERM "$p" 2>/dev/null || true
+    done
+    sleep 1
+    for p in $(_stray_pids "$LOCAL_FS_SCRIPT"); do
+      kill -KILL "$p" 2>/dev/null || true
+    done
+  fi
+  # 清掉可能已经过期的 pid 文件，避免后面按旧 pid 判"已在运行"
+  rm -f "$PROXY_PID_FILE" "$LOCAL_FS_PID_FILE" 2>/dev/null
+  # 等端口真的空出来（最多 ~6s）
+  local w=0
+  while [ "$w" -lt 12 ]; do
+    if ! port_listening "$PORT" && ! port_listening "$LOCAL_FS_PORT"; then
+      break
+    fi
+    # 端口还在，但已经不是我们的进程了 ⇒ 交给后面的检查去报错
+    if [ -z "$(_stray_pids "$PROXY_SCRIPT")" ] && [ -z "$(_stray_pids "$LOCAL_FS_SCRIPT")" ]; then
+      break
+    fi
+    sleep 0.5
+    w=$((w + 1))
+  done
+  return 0
+}
+
+# ── 本机文件服务 ───────────────────────────────────────────────
+# 它用的是飞牛系统自带的 python3（与反向代理同一个），没有别的依赖。
+start_local_fs() {
+  if local_fs_running; then
+    return 0
+  fi
+  rm -f "$LOCAL_FS_PID_FILE" 2>/dev/null
+
+  if [ ! -f "$LOCAL_FS_SCRIPT" ]; then
+    log_msg "缺少本机文件服务脚本：$LOCAL_FS_SCRIPT"
+    return 1
+  fi
+
+  local py="$PYTHON_BIN"
+  if [ ! -x "$py" ]; then
+    py="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [ -z "$py" ]; then
+    log_msg "找不到 python3（应为 /usr/bin/python3），无法启动本机文件服务"
+    return 1
+  fi
+
+  local oo_url oo_secret
+  oo_url="$(read_conf "$OO_URL_FILE" "$DEFAULT_OO_URL")"
+  oo_secret="$(read_conf "$OO_SECRET_FILE" "$DEFAULT_OO_SECRET")"
+
+  export LOCAL_FS_PORT="$LOCAL_FS_PORT"
+  # 注：不再导出 LOCAL_FS_STATIC —— 内置图纸查看器已删除（CAD 预览改用飞牛
+  #     原生「CAD 看图」应用，见 reverse-proxy.py 的 /localfs/cad 通道）。
+  export LOCAL_FS_OO_URL="$oo_url"
+  export LOCAL_FS_OO_SECRET="$oo_secret"
+  # OnlyOffice 的同源通道路径（见 local-fs.py 的 OO_SAME_ORIGIN / browser_oo_base）：
+  # 域名访问（外网穿透）时浏览器只能靠这条通道加载编辑器。
+  export LOCAL_FS_OO_SAME_ORIGIN="/localfs/oo-srv"
+
+  # PID 由脚本自己写（setsid 可能 fork，$! 不可靠）—— 与另外两个进程同一套路
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$py" "$LOCAL_FS_SCRIPT" "$LOCAL_FS_PID_FILE" >> "$LOG_FILE" 2>&1 < /dev/null &
+  else
+    nohup "$py" "$LOCAL_FS_SCRIPT" "$LOCAL_FS_PID_FILE" >> "$LOG_FILE" 2>&1 < /dev/null &
+  fi
+  disown 2>/dev/null || true
+
+  if ! wait_pid_file "$LOCAL_FS_PID_FILE" 20; then
+    log_msg "本机文件服务没有写出 PID 文件（${LOCAL_FS_PID_FILE}），请看日志"
+    return 1
+  fi
+  if ! local_fs_running; then
+    log_msg "本机文件服务进程未能存活（多半是 ${LOCAL_FS_PORT} 被占用），请看日志"
+    return 1
+  fi
+  return 0
+}
+
+stop_local_fs() {
+  local pid
+  pid="$(read_pid_file "$LOCAL_FS_PID_FILE")"
+  if check_pid_alive "$pid" 'local-fs'; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local count=0
+    while check_pid_alive "$pid" 'local-fs' && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_pid_alive "$pid" 'local-fs' && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$LOCAL_FS_PID_FILE" 2>/dev/null
+  return 0
+}
+
+kill_stray_local_fs() {
+  local pid n=0
+  # 同 kill_stray_proxy：循环杀全部，别只杀一个（理由见那里的长注释）
+  while [ "$n" -lt 10 ]; do
+    pid="$(_stray_pids "$LOCAL_FS_SCRIPT" | head -n 1)"
+    [ -z "$pid" ] && break
+    log_msg "回收残留本机文件服务 pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    check_pid_alive "$pid" 'local-fs' && kill -KILL "$pid" 2>/dev/null || true
+    n=$((n + 1))
+  done
+  return 0
+}
+
+# ── 内核 ───────────────────────────────────────────────────────
+start_kernel() {
+  local workspace="$1" authcode="$2" owner="$3"
+
+  rm -f "$PID_FILE" 2>/dev/null
+  export SIYUAN_INTERNAL_PORT="$INTERNAL_PORT"
+
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid bash "$LAUNCHER" \
+      "$PID_FILE" "$workspace" "$authcode" "$owner" \
+      "$KERNEL_BIN" "$MUSL_LOADER" "$KERNEL_DIR" >> "$LOG_FILE" 2>&1 < /dev/null &
+  else
+    nohup bash "$LAUNCHER" \
+      "$PID_FILE" "$workspace" "$authcode" "$owner" \
+      "$KERNEL_BIN" "$MUSL_LOADER" "$KERNEL_DIR" >> "$LOG_FILE" 2>&1 < /dev/null &
+  fi
+  disown 2>/dev/null || true
+}
+
+stop_kernel() {
+  local pid
+  pid="$(read_pid_file "$PID_FILE")"
+  if [ -z "$pid" ] || ! check_process "$pid"; then
+    rm -f "$PID_FILE" 2>/dev/null
+    return 0
+  fi
+
+  # SIGTERM 让思源自己收尾（把索引与事务落盘）—— 这里给到 30 秒，
+  # 工作区大的时候保存确实要一会儿，催不得。
+  kill -TERM "$pid" 2>/dev/null || true
+
+  local count=0
+  while check_process "$pid" && [ "$count" -lt 30 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+
+  if check_process "$pid"; then
+    log_msg "等待 ${count}s 仍未退出，改用 KILL"
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+
+  rm -f "$PID_FILE" 2>/dev/null
+  return 0
+}
+
+# ── 启动 ───────────────────────────────────────────────────────
+start_app() {
+  if status_app; then
+    log_msg "已在运行（内核 pid=$(read_pid_file "$PID_FILE")，代理 pid=$(read_pid_file "$PROXY_PID_FILE")），跳过启动"
+    return 0
+  fi
+
+  mkdir -p "$PKGVAR" "$PKGETC" 2>/dev/null
+  touch "$LOG_FILE" 2>/dev/null
+
+  # 目录自愈留痕：应用中心传入的目录里没有内核时才可能发生，留证据。
+  if [ -n "$APPDEST_RAW" ] && [ "$APPDEST" != "$APPDEST_RAW" ]; then
+    log_msg "应用目录自愈：应用中心传入 ${APPDEST_RAW}（那里没有内核），实际采用 ${APPDEST}"
+  fi
+
+  # 某个进程单独死了（崩过）——只补死掉的那个，别去动正在服务的笔记进程。
+  # 三个进程互相独立：内核没了笔记就没了；代理没了外部进不来；
+  # 文件服务没了只是「本机存储」用不了，不影响笔记本体。
+  if kernel_running; then
+    if ! proxy_running; then
+      log_msg "内核在运行但反向代理未运行，尝试只拉起代理"
+      if start_proxy && wait_port "$PORT" 15; then
+        log_msg "代理已恢复：pid=$(read_pid_file "$PROXY_PID_FILE") 端口=${PORT}"
+      else
+        log_msg "单独拉起代理失败，改为整体重启"
+        stop_proxy
+        stop_kernel
+      fi
+    fi
+    if kernel_running && ! local_fs_running; then
+      log_msg "内核在运行但本机文件服务未运行，尝试只拉起它"
+      if start_local_fs; then
+        log_msg "本机文件服务已恢复：pid=$(read_pid_file "$LOCAL_FS_PID_FILE") 端口=${LOCAL_FS_PORT}"
+      else
+        log_msg "本机文件服务单独拉起失败，稍后随整体重启再试一次"
+      fi
+    fi
+    if status_app; then
+      return 0
+    fi
+  fi
+
+  local workspace authcode runas
+  workspace="$(read_conf "$WORKSPACE_FILE" "$DEFAULT_WORKSPACE")"
+  authcode="$(read_conf "$AUTHCODE_FILE" "")"
+  runas="$(read_conf "$RUNAS_FILE" "owner")"
+
+  log_msg "启动：对外端口=${PORT} 内核端口=${INTERNAL_PORT} uid=$(id -u 2>/dev/null) 工作区=${workspace} 运行身份=${runas}"
+
+  # ① 包完整性 —— 缺文件时给准话，不然只会看到"已停用"
+  if [ ! -x "$KERNEL_BIN" ]; then
+    fail_start "内核不存在或不可执行：$KERNEL_BIN（应用文件可能没装全）。已找过：应用中心传入=${APPDEST_RAW:-无}、/var/apps/${APPNAME}/target、/usr/local/apps/@appcenter/${APPNAME}、/vol*/@appcenter/${APPNAME}"
+    return 1
+  fi
+  if [ ! -f "$MUSL_LOADER" ]; then
+    fail_start "缺少 musl loader：$MUSL_LOADER"
+    return 1
+  fi
+  if [ ! -f "$LAUNCHER" ]; then
+    fail_start "缺少内核启动包装脚本：$LAUNCHER"
+    return 1
+  fi
+  if [ ! -f "$PROXY_SCRIPT" ]; then
+    fail_start "缺少反向代理脚本：$PROXY_SCRIPT（应用文件可能没装全）"
+    return 1
+  fi
+
+  # ② 工作区 —— 数据是命根子，宁可不起也不要用错目录
+  if [ ! -d "$workspace" ]; then
+    fail_start "工作区不存在：${workspace}（可在 ${WORKSPACE_FILE} 里改）"
+    return 1
+  fi
+
+  # ③ ★ 先"认领并回收"自己的孤儿进程，再判端口 ★
+  #
+  #    2026-10-09 实测踩到的坑（也是用户报「停用了应用、再启动就起不来」的一环）：
+  #      · start_app 的端口检查原来只做一件事 —— 报错。
+  #      · 但占用 6806 的**往往不是** Docker 容器，而是**本应用上一轮没退干净的
+  #        reverse-proxy.py**（stop 把它 kill 掉后，若 start 紧接着跑、
+  #        或上次 stop 没走完，就会留下孤儿）。
+  #      · 于是提示"多半是旧的 Docker 容器还在跑"⇒ **把用户引到错误方向**，
+  #        真正的占用者却是自己。
+  #
+  #    正解：按 cmdline 精确认出「确实是本应用的进程」再回收。
+  #    判据是脚本路径（不是端口号、不是进程名）—— 宁可少杀也不能误杀别人的进程。
+  reclaim_strays
+
+  # 端口 —— 到这里还占着的，就是**别人的**进程了（最常见：旧 Docker 容器还在跑）。
+  # 这里**只报错不自动停容器**：容器里可能正有人用着，替用户做这个决定太危险。
+  if port_listening "$PORT"; then
+    local holder
+    holder="$(port_holder "$PORT")"
+    log_msg "端口 ${PORT} 已被占用：${holder}"
+    fail_start "端口 ${PORT} 已被占用（多半是旧的 Docker 容器还在跑）。先执行 docker stop siyuan-siyuan_E4Xr-1 再启动本应用。占用者：${holder:-未知}"
+    return 1
+  fi
+  if port_listening "$INTERNAL_PORT"; then
+    local holder2
+    holder2="$(port_holder "$INTERNAL_PORT")"
+    fail_start "内核内网端口 ${INTERNAL_PORT} 已被占用，请先释放。占用者：${holder2:-未知}"
+    return 1
+  fi
+  if port_listening "$LOCAL_FS_PORT"; then
+    local holder3
+    holder3="$(port_holder "$LOCAL_FS_PORT")"
+    fail_start "本机文件服务端口 ${LOCAL_FS_PORT} 已被占用，请先释放。占用者：${holder3:-未知}"
+    return 1
+  fi
+
+  # ③.5 ★ 把内核内网端口挡在防火墙后面 ★
+  #   内核只会绑 0.0.0.0（无 bind 参数），不加这条规则它就对全网可达 ——
+  #   穿透层绕过反代直连它就会撞上 Origin 校验失败（见函数头长注释）。
+  #   幂等、尽力而为；失败不阻断启动。
+  harden_kernel_port
+
+  # ④ 起内核
+  local owner
+  if [ "$runas" = "root" ]; then
+    owner="root"
+  else
+    owner="$(workspace_owner "$workspace")"
+  fi
+  start_kernel "$workspace" "$authcode" "$owner"
+
+  if ! wait_pid_file "$PID_FILE" 20; then
+    fail_start "内核进程没有起来，请看日志 ${LOG_FILE}"
+    return 1
+  fi
+  if ! kernel_running; then
+    fail_start "内核进程启动后立刻退出，请看日志 ${LOG_FILE}"
+    return 1
+  fi
+
+  # ⑤ 起反向代理（对外唯一入口）
+  if ! start_proxy; then
+    fail_start "反向代理启动失败（端口 ${PORT}），请看日志 ${LOG_FILE}"
+    stop_kernel
+    return 1
+  fi
+
+  # ⑥ 起本机文件服务（思源插件「本机存储」的数据面）。
+  #    它崩了笔记本身还能用，但它是本应用的标配能力 —— 起不来就明确报出来，
+  #    否则用户只会看到插件里「本机存储」是空的，却不知道为什么。
+  if ! start_local_fs; then
+    fail_start "本机文件服务启动失败（端口 ${LOCAL_FS_PORT}），请看日志 ${LOG_FILE}"
+    stop_proxy
+    stop_kernel
+    return 1
+  fi
+  if ! wait_port "$LOCAL_FS_PORT" 20; then
+    fail_start "本机文件服务没有监听端口 ${LOCAL_FS_PORT}，请看日志 ${LOG_FILE}"
+    stop_local_fs
+    stop_proxy
+    stop_kernel
+    return 1
+  fi
+
+  # ⑦ 再等对外端口真正 listen —— 代理起来了才算"能用"
+  if wait_port "$PORT" 60; then
+    log_msg "已就绪：内核 pid=$(read_pid_file "$PID_FILE")(:${INTERNAL_PORT}) 代理 pid=$(read_pid_file "$PROXY_PID_FILE")(:${PORT}) 文件服务 pid=$(read_pid_file "$LOCAL_FS_PID_FILE")(:${LOCAL_FS_PORT}) 身份=${owner}"
+    return 0
+  fi
+
+  if ! kernel_running; then
+    fail_start "内核进程在启动过程中退出（可能工作区被占用或损坏），请看日志 ${LOG_FILE}"
+    stop_proxy
+    return 1
+  fi
+
+  log_msg "内核在跑但端口未就绪，仍按成功处理（内核可能正在索引大工作区）"
+  return 0
+}
+
+stop_app() {
+  log_msg "停止中…"
+  # 先停文件服务与代理：立刻断开外部入口，内核就不再接到新请求
+  stop_local_fs
+  kill_stray_local_fs
+  stop_proxy
+  kill_stray_proxy
+  stop_kernel
+  log_msg "已停止"
+  return 0
+}
+
+case "$1" in
+  start)
+    start_app
+    ;;
+  stop)
+    stop_app
+    ;;
+  status)
+    if status_app; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  unhard)
+    # 排障用：撤销内核端口的防火墙加固（例如本机调试要直连 16806）
+    unharden_kernel_port
+    ;;
+  *)
+    echo "未知命令：$1" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+    exit 1
+    ;;
+esac
