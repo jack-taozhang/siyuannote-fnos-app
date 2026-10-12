@@ -1,0 +1,33 @@
+#!/bin/bash
+#
+# 安装前检查（fnOS 在写入应用文件之前调用）
+#
+# 这里只做「看一眼环境」的软检查，任何情况下都返回 0 ——
+# 真正会阻断安装的硬性条件由应用中心自己校验。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+say() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [install_init] $1"
+}
+
+say "准备安装 ${TRIM_APPNAME:-siyuannote} ${TRIM_APPVER:-}"
+say "系统 ${TRIM_SYS_VERSION:-未知}（${TRIM_SYS_ARCH:-未知架构}），安装目标 ${TRIM_APPDEST_VOL:-未知存储空间}"
+say "服务端口 ${TRIM_SERVICE_PORT:-未声明}"
+
+# 本应用自带的内核是 x86-64 的 Go 二进制。
+arch="$(uname -m 2>/dev/null)"
+say "宿主架构 ${arch}"
+case "$arch" in
+  x86_64|amd64) : ;;
+  *) say "⚠ 包内内核是 x86-64 版本，当前架构 ${arch} 可能无法运行。" ;;
+esac
+
+# 端口占用提示：装之前你原来的思源容器多半还在跑，这里先说清楚下一步要做什么。
+PORT="${TRIM_SERVICE_PORT:-6806}"
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"; then
+    say "提示：端口 ${PORT} 已被占用（多半是你原来那个思源 Docker 容器）。安装后需要先 docker stop siyuan-siyuan_E4Xr-1，本应用才能启动。"
+  fi
+fi
+
+exit 0
