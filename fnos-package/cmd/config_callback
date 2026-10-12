@@ -1,0 +1,36 @@
+#!/bin/bash
+#
+# 用户在应用设置里点「保存」之后调用 —— 把服务重新拉起来，让新设置立刻生效。
+#
+# 启动方式只在 cmd/main 里定义一处，这里只做 stop + start，
+# 免得两个地方各拼一遍启动命令、然后某天漏改一处。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+LOG_FILE="${PKGVAR}/app.log"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [config_callback] $1" >> "$LOG_FILE"
+}
+
+mkdir -p "$PKGVAR" 2>/dev/null
+touch "$LOG_FILE" 2>/dev/null
+
+# 同上：cmd/ 在 /var/apps/<app>/cmd/，不在 TRIM_APPDEST 下
+MAIN=""
+for cand in "${TRIM_APPDEST}/cmd/main" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/main"; do
+  if [ -x "$cand" ]; then MAIN="$cand"; break; fi
+done
+if [ -n "$MAIN" ]; then
+  log_msg "设置已保存，交由 cmd/main 重启"
+  "$MAIN" stop >> "$LOG_FILE" 2>&1
+  if "$MAIN" start >> "$LOG_FILE" 2>&1; then
+    log_msg "设置已生效，服务已重新启动"
+    exit 0
+  fi
+  log_msg "重启失败，请看日志：$LOG_FILE"
+  echo "思源笔记：设置已保存，但应用启动失败，请查看日志 $LOG_FILE" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+  exit 1
+fi
+
+log_msg "未找到 cmd/main，无法自动重启"
+exit 1
