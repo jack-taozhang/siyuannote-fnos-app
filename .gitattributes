@@ -1,0 +1,45 @@
+# 默认按文本入库，检出时转 CRLF（Windows 开发环境）
+* text=auto eol=crlf
+
+# ---- ★ 必须在 LF ★ ----
+# 这些是要拿到飞牛上直接执行的 shell 脚本。
+# 仓库里存成 CRLF ⇒ 检出到 Linux/NAS 后第一行就是 `#!/bin/bash\r`
+# ⇒ 内核报 `bad interpreter: /bin/bash^M` ⇒ 应用直接起不来。
+# ★ 这类事故必须在入库阶段挡住，不能靠部署时手改。★
+
+# 生命周期脚本（cmd/ 下的 9 个，无扩展名）
+fnos-package/cmd/*          text eol=lf
+fnos-package/cmd/main       text eol=lf
+
+# 应用内脚本
+fnos-package/app/launch-kernel.sh   text eol=lf
+fnos-package/app/*.py               text eol=lf
+
+# 仓库内的运维脚本
+tools/*.sh   text eol=lf
+scripts/*.sh text eol=lf
+
+# ---- 二进制：不做行尾转换 ----
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.wasm  binary
+*.fpk   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.tgz   binary
+*.mp4   binary
+*.mp3   binary
+*.pdf   binary
+*.webp  binary
+
+# ---- 构建产物：逐字节可复现，不做转换 ----
+/index.js  -text
+/index.css -text
+
+# ---- 上游产物 ----
+vendor/**   -text
+dist/**     -text
