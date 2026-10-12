@@ -1,0 +1,61 @@
+#!/bin/bash
+#
+# 安装完成后（fnOS 已把应用文件写入 TRIM_APPDEST）
+#
+# 做三件事：准备运行期目录、记安装日志、尝试把服务拉起来。
+#
+# 注意：这里是**允许失败**的。装完时旧的思源 Docker 容器通常还占着 6806，
+# 服务起不来是预期内的 —— 所以失败时给的是"下一步怎么做"，
+# 而不是一句没有出路报错。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+PKGETC="${TRIM_PKGETC:-${PKGVAR}}"
+LOG_FILE="${PKGVAR}/app.log"
+PORT="${TRIM_SERVICE_PORT:-6806}"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [install_callback] $1" >> "$LOG_FILE"
+}
+
+mkdir -p "$PKGVAR" "$PKGETC" 2>/dev/null
+touch "$LOG_FILE" 2>/dev/null
+
+# 覆盖安装 / 重装场景下可能残留旧 PID
+rm -f "${PKGVAR}/app.pid" 2>/dev/null
+
+log_msg "安装完成：版本 ${TRIM_APPVER:-未知}，应用目录 ${TRIM_APPDEST:-未知}"
+
+if grep -q '"run-as"[[:space:]]*:[[:space:]]*"root"' "${TRIM_APPDEST}/config/privilege" 2>/dev/null; then
+  log_msg "root 权限版：生命周期脚本以 root 运行；内核默认降权到工作区属主（文件属主与容器时代一致），可用 ${PKGETC}/run-as 写 root 改成直接以 root 跑。"
+else
+  log_msg "⚠ 未检测到 run-as: root，请确认包未被改动。"
+fi
+
+# 应用文件自检 —— 少一个就是"装上了但起不来"
+missing=""
+for f in kernel-dist/kernel kernel-dist/ld-musl-x86_64.so.1 launch-kernel.sh local-fs.py cmd/main; do
+  [ -e "${TRIM_APPDEST}/${f}" ] || missing="${missing} ${f}"
+done
+if [ -n "$missing" ]; then
+  log_msg "⚠ 应用文件缺失：${missing}"
+  echo "思源笔记安装不完整，缺少：${missing}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
+fi
+
+# cmd/ 不在 TRIM_APPDEST 下 —— 飞牛把包里的 cmd/ 放到 /var/apps/<app>/cmd/，
+# 而 TRIM_APPDEST 指向的是 payload（kernel-dist、launch-kernel.sh 那一层）。
+# 两个位置都试一下，免得"装完不会自启"这种哑巴故障。
+MAIN=""
+for cand in "${TRIM_APPDEST}/cmd/main" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/main"; do
+  if [ -x "$cand" ]; then MAIN="$cand"; break; fi
+done
+if [ -n "$MAIN" ]; then
+  if "$MAIN" start >> "$LOG_FILE" 2>&1; then
+    log_msg "安装后服务已启动"
+    echo "思源笔记安装完成，已在本机原生运行（端口 ${PORT}）。"
+  else
+    log_msg "安装后自动启动未成功（多半是端口 ${PORT} 还被旧容器占着）"
+    echo "思源笔记安装完成，但端口 ${PORT} 被占用。请先停掉旧的思源容器：docker stop siyuan-siyuan_E4Xr-1，然后在应用中心点「启动」。"
+  fi
+fi
+
+exit 0
