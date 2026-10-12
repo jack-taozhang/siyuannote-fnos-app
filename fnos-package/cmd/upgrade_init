@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# 升级前：如果应用正在运行，先停掉，并记一个「升级前是运行中」的标记。
+#
+# 升级会覆盖 TRIM_APPDEST 下的应用文件，进程还在跑会占用文件；
+# 同时也要给思源时间把数据落盘（与 cmd/main stop 同样的 30 秒）。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+PID_FILE="${PKGVAR}/app.pid"
+PROXY_PID_FILE="${PKGVAR}/proxy.pid"
+LOCAL_FS_PID_FILE="${PKGVAR}/local-fs.pid"
+FLAG_FILE="${PKGVAR}/.was_running"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [upgrade_init] $1" >> "${PKGVAR}/app.log"
+}
+
+check_process() {
+  kill -0 "$1" 2>/dev/null
+}
+
+mkdir -p "$PKGVAR" 2>/dev/null
+rm -f "$FLAG_FILE" 2>/dev/null
+
+# 先停本机文件服务：升级会覆盖 local-fs.py 本体，进程活着会占住文件
+if [ -f "$LOCAL_FS_PID_FILE" ]; then
+  pid="$(head -n 1 "$LOCAL_FS_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    log_msg "升级前停止本机文件服务，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+    count=0
+    while check_process "$pid" && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_process "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$LOCAL_FS_PID_FILE"
+fi
+
+stray_lfs="$(pgrep -f 'local-fs.py' 2>/dev/null | head -n 1)"
+if [ -n "$stray_lfs" ]; then
+  log_msg "升级前清理残留本机文件服务，pid=${stray_lfs}"
+  kill -TERM "$stray_lfs" 2>/dev/null
+fi
+
+# 先停反向代理：升级会覆盖 reverse-proxy.py 本体，进程活着会占住文件
+if [ -f "$PROXY_PID_FILE" ]; then
+  pid="$(head -n 1 "$PROXY_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    log_msg "升级前停止反向代理，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+    count=0
+    while check_process "$pid" && [ "$count" -lt 5 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    check_process "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$PROXY_PID_FILE"
+fi
+
+stray="$(pgrep -f 'reverse-proxy.py' 2>/dev/null | head -n 1)"
+if [ -n "$stray" ]; then
+  log_msg "升级前清理残留反向代理，pid=${stray}"
+  kill -TERM "$stray" 2>/dev/null
+fi
+
+if [ -f "$PID_FILE" ]; then
+  pid="$(head -n 1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$pid" ] && check_process "$pid"; then
+    touch "$FLAG_FILE"
+    log_msg "升级前停止服务，pid=${pid}"
+    kill -TERM "$pid" 2>/dev/null
+
+    count=0
+    while check_process "$pid" && [ "$count" -lt 30 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+
+    check_process "$pid" && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$PID_FILE"
+fi
+
+log_msg "升级开始：${TRIM_OLD_APPVER:-?} → ${TRIM_APPVER:-?}"
+exit 0
