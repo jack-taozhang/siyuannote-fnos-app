@@ -1,138 +1,154 @@
 # 升级指南
 
-思源插件三条线：**版本号对齐**、**本地部署**、**与 NAS 侧应用的联动**。
+本应用（`siyuannote`）**不自带**思源内核 —— 内核在打包时从别处提取进包里。
+升级分三条线：思源内核版本、本仓库代码版本、上游依赖。
 
 ---
 
-## 1. ★ 版本号必须两处对齐
+## 1. 上游：思源内核
 
-思源内核**按 `plugin.json` 的 `version` 缓存插件 JS**，版本号不变 ⇒ 用户跑的还是旧代码。
+- **当前锁定：`3.8.6`**（Linux x86_64 Go 二进制，约 132 MB）
+- 上游：<https://github.com/siyuan-note/siyuan>
+- 许可：AGPL-3.0（**分发时必须保留其许可声明**）
+
+内核**不在版本库里** —— `fnos-package/app/kernel-dist/` 是打包时生成的，
+已列入 `.gitignore`。clone 之后直接 build 是跑不起来的，先按下面提取。
+
+### 提取内核
+
+`scripts/build-fpk.sh` 会在飞牛宿主上就地提取（推荐，内核不来回搬）：
+
+```bash
+cd /vol1/1000/Docker/siyuannote
+sudo bash scripts/build-fpk.sh              # 增量
+sudo bash scripts/build-fpk.sh --refresh    # 强制重新提取
+```
+
+### 换内核版本
+
+1. 换掉容器里的思源镜像/tag，或直接放一份新的 `kernel-dist/`。
+2. `kernel-dist/` 里必须有以下几项，缺一项应用会报「内核不存在或不可执行」：
+   - `kernel`（可执行文件）
+   - `stage/`（前端构建产物）
+   - `appearance/`、`stage/build/` 等资源目录
+   - `ld-musl-x86_64.so.1` 与 `libc.musl-x86_64.so.1`（见下）
+3. 重新 `bash scripts/build-fpk.sh --refresh` 出包。
+
+### ★ 换内核版本后必须回归的三件事
+
+思源内核这几年改过几次行为，本应用是为**具体版本行为**写的适配：
+
+| 事项 | 触发版本 | 本应用的对策 |
+|---|---|---|
+| WebSocket 升级时比对 Origin 的 host 与 Host | 3.8.4+ | `reverse-proxy.py` 把 Origin 的 host 对齐到 Host（**只动这一个头**，其余字节不改） |
+| 同源校验加强，通报 `Auth failed: invalid request origin` | 3.8.4+ | 内核退到 `16806` 仅绑回环 + 防火墙挡住外部来源；穿透层绕过反代直连也会被丢包 |
+| 手机按 UA 切移动版界面 | 一直如此 | 应用挂载入口固定 `/stage/build/desktop`；登录页里 `to` 为空或 `/` 时兜底也走桌面版 |
+| 插件 API `savePluginData` / `getFile` 返回 200 空体 | 3.8.x | 插件侧已改用 `/api/file/putFile` + `/api/file/getFile`（见 siyuan-localfs） |
+
+**内核默认走「Local HTTPS + HTTP/2」**。本应用的反代与三条同源通道都是纯 HTTP，
+所以同一个端口上 HTTP 与 HTTPS 双模可用 —— 这条实测成立，不要因为「内核是 HTTPS 的」
+就以为通道也要上 TLS。
+
+---
+
+## 2. 为什么必须带 musl loader
+
+思源官方镜像基于 Alpine（musl），内核 ELF 头写着
+`interpreter /lib/ld-musl-x86_64.so.1`；飞牛是 Debian（glibc），**没有这个文件**。
+
+直接跑会报 `No such file or directory` —— **是 loader 不在，不是内核不在**。
+所以包里随带 `ld-musl-x86_64.so.1` 与 `libc.musl-x86_64.so.1`，
+启动时显式调起：
+
+```bash
+loader --library-path <dir> kernel
+```
+
+`ldd` 只报 libc 一项 ⇒ 其余是纯静态链接，带这两个文件就够。
+**换内核版本后请重新跑一次 `ldd`确认这个结论仍成立**（若上游改成静态链接，就可以不带）。
+
+---
+
+## 3. 本仓库代码版本
+
+版本号在三处，必须同步：
 
 | 文件 | 字段 | 当前 |
 |---|---|---|
-| `plugin.json` | `version` | 1.12.11（**权威**） |
-| `package.json` | `version` | 1.12.11 |
+| `fnos-package/manifest` | `version` | 2.2.1 |
+| `fnos-package/manifest` | `changelog` | 见文件 |
+| （若已发版）GitHub Release tag | `v2.2.1` | |
 
-**任何影响 `index.js` / `index.css` 的改动都必须升 `plugin.json` 的 version**，
-否则用户那边什么都不会变 —— 且不报任何错。
+★ `manifest` 是 **INI 格式，值里不能出现 `;` 或 `#`**，会被当注释截断
+（`changelog` 最容易踩）。`build-fpk.sh` 会在打包前拦下这类错误。
 
-★ `index.js` 与 `index.css` **必须成对传**：Vue 的 scope id 随源码变，
-只更新 JS 会导致样式整体失效。
+### `build-fpk.sh` 会预检的错误
 
-★ **部署 ≠ 生效**：`cp` 不触发热重载。判"用户跑着哪份 JS"要连真机看，
-别靠版本号猜。
+装到 NAS 上才发现代价太高，所以打包前先拦：
 
----
-
-## 2. 构建
-
-```bash
-npm run build        # src/ → index.js + index.css（仓库根）
-npm run pack         # 出可导入的 zip（从已构建产物取，不重建）
-npm test             # 契约测试
-```
-
-`package.json` 的 version 必须与 `plugin.json` 对齐。
+- 缺 `cmd/` 下任一生命周期脚本（fnOS 判「应用包不符合系统要求」直接拒装）
+- `config/privilege` 的 `run-as` 不是 `root`
+- `manifest` 值里有 `;` 或 `#`
+- `display_name` 带了括号后缀
+- 缺 `kernel-dist/kernel`、`kernel-dist/stage` 等关键文件
 
 ---
 
-## 3. 本地部署（到 NAS 上跑着的思源）
+## 4. 上游依赖关系
 
-```bash
-# ★ 口令一律从环境变量读，不带默认值 ★
-export NAS_PW='你的口令'
+本应用**借用**三个飞牛原生应用，三条链路全部挂在 6806 同源通道上：
 
-bash tools/deploy-nas.sh          # 构建 → scp →/tmp→ sudo cp → md5 双向核对
-bash tools/hot-patch-localfs.sh   # 只热补后端 local-fs.py，只重启文件服务进程
-```
-
-### 部署纪律（都是踩过的坑）
-
-- **scp → `/tmp` → `cp` → md5 双向核对**。SMB 不可靠，曾出现 scp 全 FAIL 但 cp 照跑。
-- **之后必查 `ctime`**：md5 对 ≠ 没人再动过。**判据只认 md5 + ctime。**
-- Git Bash 会改写 argv 里的绝对路径（`/tmp/x.sh` → `E:/TEMP/x.sh`）⇒
-  传路径前加 `MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1`。
-  ⚠️ 跑 `deploy-nas.sh` / `build-fpk-nas.sh` **不能**加这两个变量。
-- 容器内**没有 `python3`**（宿主 3.11.2）。paramiko 只在
-  `…/envs/default/Scripts/python.exe`。
-- 本机 `spawnSync` / `execSync` **一律 EBUSY**（`{status:null,error:'EBUSY'}` 且不抛）
-  ⇒ Node 脚本里只用**异步 `spawn`**。
-
-### 插件与 FPK 解耦
-
-FPK 里**不含插件**，只装后端（内核 + `local-fs.py` + `reverse-proxy.py` + `ui`）。
-
-- 改**插件** → 不用重打 FPK，`tools/deploy-nas.sh` 即可。
-- 改**后端**（NAS 上的 `.py`）→ 必须重打 FPK，走
-  `siyuannote-fnos-app` 的打包流程。
-
----
-
-## 4. 与 NAS 侧应用的联动
-
-插件预览四条链路，实际有三条是「借用飞牛应用」，全走思源反代 6806 的**同源通道**：
-
-| 格式 | 通道前缀 | 目标应用 | 端口 |
+| 通道前缀 | 目标应用 | 端口 | 用途 |
 |---|---|---|---|
-| DWG / DXF | `/localfs/cad/*` | CAD 看图（fnos-dwg-viewer） | 8020 |
-| Office / PDF | `/localfs/docs/*` | 官方「Office文档」 | 5666 |
-| 其余全部 | `/localfs/fv/*` | 文件预览（fnos-file-viewer） | 8030 |
+| `/localfs/cad/*` | 「CAD 看图」 | 8020 | DWG / DXF 预览 |
+| `/localfs/fv/*` | 「文件预览」 | 8030 | 其余全部格式 |
+| `/localfs/docs/*` | 官方「Office文档」(`trim.docs`) | 5666 | Office / PDF |
 
-### ★ 同源不是"洁癖"，是功能前提
+> ★ 为什么不直连各自端口：手机经 FN Connect 穿透时**只映射 6806** 一个端口。
+> ★ 为什么要同源：思源插件要靠同源 iframe 注入样式，把查看器自带的外壳藏掉；
+> 跨源会静默失效，工具栏/命令行/文件树会全部冒回来。
 
-内嵌要**净化**：藏掉查看器自带的工具条 / 命令行 / 底部状态栏 / 左侧文件树 /
-Office 工具栏，靠的是 `iframe.contentDocument` 注入样式（`src/purify.js`）。
-**一旦跨源，`contentDocument` 恒 null ⇒ 注入静默失败，那些外壳全部回来。**
+三个应用各有自己的仓库与发版节奏：[fnos-dwg-viewer](https://github.com/jack-taozhang/fnos-dwg-viewer)、
+[fnos-file-viewer](https://github.com/jack-taozhang/fnos-file-viewer)。
+**它们的 DOM 类名/id 被本应用的净化逻辑依赖，改结构时要互相通知。**
 
-所以插件侧三条链路**一律走 `:6806`，绝不直连应用端口**（`api.js` 的 `channelUrl`）。
-
-### ⚠️ 桌面客户端是跨源的（已知限制）
-
-思源**桌面客户端**跑的是**本机内核**（`http://127.0.0.1:6806`），本机没有反代；
-而 iframe 指向 NAS 的 `http://<nas>:6806` ⇒ **不同源** ⇒ 净化失效。
-
-表现：桌面端嵌入块里 CAD 的 ribbon / 命令行 / 状态栏、文件预览的侧栏都看得见。
-
-**要彻底修，得让被借用的应用自己认一个 URL 参数来自藏外壳**（如 `?bare=1`），
-而不是靠宿主页注入 —— 浏览器同源策略没有第三条路。
-各家应用的实现与回归清单见各自仓库的 `UPGRADING.md`。
-
-### 通道前缀改动要两边同步
-
-前缀与端口定义在 `siyuannote-fnos-app` 的 `reverse-proxy.py`（`PROXY_*_PREFIX`）
-与 `cmd/main`，插件侧在 `api.js`（`CAD_PREFIX` / `FV_PREFIX` / `DOCS_PREFIX`）。**改一处必须改两处。**
+⚠️ 反代对 `/localfs/docs/*` 的请求：**没带飞牛凭据时会自动补上**
+（凭据由插件在同源侧 POST `/localfs/api/fnos-cred` 落到 `$TRIM_PKGVAR/fnos-cred.json`，权限 600，
+只挑 `ost` / `osrt` / `fnos-token` / `fnos-long-token` 四个 cookie）。
+客户端自带凭据时**绝不覆盖**。接口永不回显凭据内容。
 
 ---
 
-## 5. 插件 API 的三个陷阱
+## 5. 可配置项
 
-思源内核插件 API 有**三条路径是"200 空体"陷阱**（SPA 兜底），写代码前必读：
+改完要在应用中心把应用**停一下再启动**才生效（配置是进程启动时读的）。
+文件都在应用数据目录 `TRIM_PKGVAR`（形如 `/usr/local/apps/@appdata/siyuannote`）下：
 
-| 用途 | ✅ 正确 | ❌ 无效 |
+| 文件 | 默认 | 说明 |
 |---|---|---|
-| 写数据 | `/api/file/putFile`（multipart FormData，`path` = `/data/storage/petal/<插件名>/<name>`，**无扩展名**，`file` = Blob） | `/api/petal/savePluginData`（**不存在**） |
-| 读数据 | `/api/file/getFile`（POST `{path}`） | `/api/getFile` |
-| 停靠项 / 页签图标 | `addIcons('<symbol id="iconXxx" viewBox="0 0 32 32">…')` + `addDock({config:{icon:"iconXxx"}})` | 直接传整段内联 SVG（**渲染成空白且不报错**） |
+| `workspace.path` | `/vol1/docker/project/dk_app/siyuan/siyuan_E4Xr/data` | 思源工作区绝对路径 |
+| `authcode` | 空 | 访问鉴权码 |
+| `run-as` | `owner` | `owner` = 内核降权到工作区属主；`root` = 直接以 root 跑 |
+| `oo-secret` | `nebula-oo-secret-change-me` | OnlyOffice JWT 密钥，**部署后请改掉** |
 
-★ **读的 API 没确认过就别写**。核对"读回一致"必须用**同一条能真读到内容的通道**，
-否则"两边都是空"也会显示"一致" —— 真机上踩过，把用户的真设置写成了 0 字节。
-
-★ 探活必须核对身份：只判 `ok:true` 会认错人（裸根 `/api/health` 答的可能是别的应用）。
-正解 = 认死 `app === "siyuan-local-fs"`。
+日志：同目录 `app.log`，应用侧输出带 `[local-fs]` / `[proxy]` 前缀。
+内核日志在 `/usr/local/apps/@appcenter/siyuannote/*.log`。
 
 ---
 
-## 6. 测试纪律
+## 6. 排查入口
 
-**整段归零（0 通过 / 1 失败）= 文件没跑起来（语法错）**，真报错在 **stderr**。
-
-**绝不为"让测试变绿"改产品代码。**
+| 现象 | 先看哪 |
+|---|---|
+| 应用起不来 / `TRIM_APPDEST` 指向不存在的目录 | `cmd/main` 的应用目录自愈逻辑（按「哪个目录里真有 kernel-dist/kernel」定，不盲信环境变量） |
+| 手机上提示 `invalid request origin` | 反代的 Origin↔Host 对齐是否生效；内核防火墙规则是否在位 |
+| 嵌入块里 Office / CAD 工具栏冒出来 | 是不是跨源了（同源通道是否走通）；净化类名是否还对得上 |
+| 反代在 `Connection: close` 的请求上收不到内容 | 反代对该请求的处理分支 |
 
 ---
 
-## 7. 仓库约定
+## 7. 许可
 
-- `dist/` / `dist-package/` / `vendor/` 都是构建产物，不入库。
-- 口令、token 一律不进版本库；`tools/.nb-local.json`、`.gh-token` 已 gitignore。
-- `.verify/` 里含真实 NAS 凭据与 Chrome 配置 ⇒ **绝不可入库**。
-- `.workbuddy/`（工作区记忆，可能含真实口令与 token）⇒ **绝不可入库**。
+本仓库自身的代码 MIT。**随包的思源内核是 AGPL-3.0**，
+再分发时必须附带其许可声明与源码获取途径（指向 <https://github.com/siyuan-note/siyuan>）。
+`manifest` 里 `source=thirdparty` 就是这个意思。
