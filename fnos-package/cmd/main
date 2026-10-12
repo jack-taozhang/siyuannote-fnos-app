@@ -341,6 +341,35 @@ start_proxy() {
   export PROXY_DOCS_HOST="127.0.0.1"
   export PROXY_DOCS_PORT="${TRIM_DOCS_PORT:-5666}"
 
+  # ★ HTTPS 支持（见 reverse-proxy.py 的 TLS_ENABLED 说明）：
+  # 桌面思源（EXE）的渲染页面跑在 https://127.0.0.1:<随机端口>，而插件拼出来的
+  # 文档 iframe 走 $PORT（这里 6806）。若 6806 只有 HTTP，Chromium 会以
+  # Mixed Content 拦掉整帧 + 内层所有图标 ⇒ 症状就是"工具栏只剩零星几个点"。
+  # 所以让代理也能讲 HTTPS，与页面同协议。
+  #
+  # ★★ 证书必须是「桌面端信任的那个 CA」签发的（2026-10-11 二修）★★
+  #   一度直接拿思源工作区 conf/ 里的 cert.pem/key.pem —— **不行**：
+  #   每个思源工作区有**自己独立生成的一套 CA**（本机那份 serial 9A15F6…，
+  #   NAS 那份 A3C78B…，两者毫无关系）。桌面 Electron 只信任**本机**那一份，
+  #   用 NAS 自签的会直接 `net::ERR_CERT_AUTHORITY_INVALID`。
+  #   ⇒ 这里改用**离线签发好、由桌面端信任的 CA 签的**服务器证书：
+  #        /vol1/@appdata/siyuannote/tls/server.crt（叶+CA 两段，链完整）
+  #        /vol1/@appdata/siyuannote/tls/server.key
+  #     其 SAN 覆盖 localhost / 127.0.0.1 / 192.168.193.70 / 172.16.30.128。
+  #     签发脚本与物料见 siyuan-localfs/tools/make-fnos-cert.sh（用本机 CA 签）。
+  #
+  # ★ 共用 $PORT（不新开端口）：靠首字节嗅探分流（TLS ClientHello 首字节恒为
+  #   0x16）。这与思源内核自身 55620 的做法一致，外网穿透也只需映射一个端口。
+  # ★ 证书缺失/读不了**绝不阻断启动**：退化成纯 HTTP（桌面端仍是老样子，
+  #   但不比改造前更差）。
+  local tls_dir="/vol1/@appdata/siyuannote/tls"
+  if [ -f "${tls_dir}/server.crt" ] && [ -f "${tls_dir}/server.key" ]; then
+    export PROXY_TLS_CERT="${tls_dir}/server.crt"
+    export PROXY_TLS_KEY="${tls_dir}/server.key"
+  else
+    log_msg "未找到反代 TLS 证书（${tls_dir}/server.crt），反向代理将以纯 HTTP 运行"
+  fi
+
   # PID 由脚本自己写（setsid 可能 fork，$! 不可靠）—— 与 launch-kernel.sh 同一套路
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "$py" "$PROXY_SCRIPT" "$PROXY_PID_FILE" >> "$LOG_FILE" 2>&1 < /dev/null &
