@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# 卸载完成后：收尾清理。
+#
+# ★★ 这里只清运行期的 PID 与日志 ★★
+#    思源的工作区（笔记本、历史、快照）全都在 TRIM_APPDEST 之外，
+#    卸载这个应用**一个字节都不该动**。下面刻意不出现任何 rm -rf，
+#    就是为了让下一个人一眼看出"数据不在这里"。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+
+rm -f "${PKGVAR}/app.pid" 2>/dev/null
+rm -f "${PKGVAR}/proxy.pid" 2>/dev/null
+rm -f "${PKGVAR}/local-fs.pid" 2>/dev/null
+rm -f "${PKGVAR}/app.log" 2>/dev/null
+rmdir "$PKGVAR" 2>/dev/null
+
+echo "思源笔记已卸载（笔记数据保留在原工作区，未做任何改动）。"
+exit 0
