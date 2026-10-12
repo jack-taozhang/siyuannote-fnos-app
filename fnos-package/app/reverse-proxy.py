@@ -84,6 +84,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -93,6 +94,44 @@ LISTEN_HOST = os.environ.get('PROXY_LISTEN_HOST') or '0.0.0.0'
 LISTEN_PORT = int(os.environ.get('PROXY_LISTEN_PORT') or '6806')
 UPSTREAM_HOST = os.environ.get('PROXY_UPSTREAM_HOST') or '127.0.0.1'
 UPSTREAM_PORT = int(os.environ.get('PROXY_UPSTREAM_PORT') or '16806')
+
+# ── ★ HTTPS 监听（2026-10-11 加）★ ────────────────────────────────
+# ★ 为什么必须有它 ★
+#   思源桌面端（微软商店版）开了「网络伺服」后，**渲染页面跑在
+#   `https://127.0.0.1:<随机端口>`**（本机实测：conf.json 的
+#   system.networkServe=true，内核自己签了 CA「SiYuan Local CA」并把
+#   服务包成 HTTPS）。
+#   而插件给 Office / CAD / 文件预览拼的是**跨源到 NAS 反代**的地址，
+#   一旦反代只有 HTTP ⇒ 页面是 https、iframe 是 http
+#   ⇒ **Chromium 混合内容策略直接拦掉整个 iframe**，内层 OO 的 css /
+#   几百个 XHR / WebSocket / **全部图标 PNG** 也被逐个拦（日志刷屏
+#   "requested an insecure image … has been blocked"）。
+#   用户看到的就是"Office 工具栏只剩零星几个点"，而 6806 网页版
+#   （HTTP→HTTP）完全正常。
+#   ⇒ 反代**同时**监听 HTTPS，插件按页面协议自适应（见 api.js 的
+#     pageScheme）：https 页面拼 https、http 页面拼 http，两种都活。
+#
+# ★ 证书从哪来 ★
+#   直接用**思源工作区 conf/ 里那套**（ca.crt/cert.pem/key.pem）——
+#   内核自己生成、SAN 已覆盖 NAS 的各网卡地址（实测本机：
+#   `DNS:localhost, 127.0.0.1, 172.16.30.128, 192.168.193.70, ::1`），
+#   且**思源桌面端 Electron 天然信任自己的本地 CA** ⇒ 桌面端零报警。
+#   路径与开关由 cmd/main 通过环境变量传入（PROXY_TLS_*）；
+#   不传就是不启用（保持纯 HTTP 行为，向后兼容）。
+#
+# ★★ 为什么 HTTPS 与 HTTP **共用 6806 这一个端口** ★★
+#   插件拼的是 `https://<nas>:6806/…`（端口号与 HTTP 一致，见 api.js 的
+#   PROXY_PORT 常量，全项目只认这一个数字）。让 HTTPS 另起端口会牵动
+#   插件、穿透映射、文档一大堆地方，得不偿失。
+#   ⇒ 用**首字节嗅探**分流：TLS 的 ClientHello 第一条记录类型恒为
+#     `0x16`（handshake），HTTP 请求行恒以字母开头（GET/POST/…）
+#     ⇒ accept 之后 `recv(1, MSG_PEEK)` 一眼就能分出该走哪条路。
+#     这也是业界标准做法（nginx 的 `ssl_preread`、HAProxy 的
+#     `tcp-request inspect-delay` 同理），对本项目零额外成本。
+TLS_CERT = os.environ.get('PROXY_TLS_CERT') or ''
+TLS_KEY = os.environ.get('PROXY_TLS_KEY') or ''
+# 开关：证书两个都给齐了才启用（缺一视为不启用，绝不让代理因为证书起不来）
+TLS_ENABLED = bool(TLS_CERT and TLS_KEY)
 
 # ── 本机文件服务的同源通道 ──────────────────────────────────────────
 # ★ 为什么需要它 ★
@@ -1417,6 +1456,91 @@ def _close(sock):
         pass
 
 
+# ── TLS 支持（与 HTTP 共用 LISTEN_PORT，靠首字节嗅探分流）──────────
+#
+# ★ 见文件头 TLS_ENABLED 那段：桌面端页面是 https，插件拼的 iframe 也必须
+#   https，否则混合内容被拦。这里把同一端口上的 TLS 握手接住。
+#
+# ★ 为什么用 SSLContext 而不是 ssl.wrap_socket ★
+#   wrap_socket 在 Python 3.12 起已废弃；SSLContext 还能顺手设最低版本、
+#   关掉压缩，属于正确做法。
+_tls_ctx = None
+# ★ 建失败也要记住：否则**每个**连接都重试一次 load_cert_chain 并打一行日志，
+#   高并发下刷屏 + 反复做无用的文件 IO。True 表示"试过了，不行，别再试"。
+_tls_failed = False
+
+
+def _build_tls_context():
+    """建一次 SSLContext 复用；证书读不到时返回 None（不启用 TLS，不崩）。"""
+    global _tls_ctx, _tls_failed
+    if _tls_ctx is not None:
+        return _tls_ctx
+    if not TLS_ENABLED or _tls_failed:
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # 只留 TLS1.2+：飞牛上那个 python3.11 默认就够，显式写清意图
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        except Exception:
+            pass
+        ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
+        # 客户端不要求出示证书（本代理面向浏览器/Electron）
+        ctx.verify_mode = ssl.CERT_NONE
+        _tls_ctx = ctx
+        log('已启用 HTTPS：证书=%s 与 HTTP 共用端口 %d（按首字节嗅探分流）'
+            % (TLS_CERT, LISTEN_PORT))
+        return ctx
+    except Exception as exc:
+        _tls_failed = True
+        log('启用 HTTPS 失败（%s），保持纯 HTTP：%s' % (exc, TLS_CERT))
+        return None
+
+
+def _is_tls_client_hello(client):
+    """首字节 0x16 = TLS handshake 记录 ⇒ 这是 HTTPS 连接。
+
+    ★ 用 MSG_PEEK：**不消费**字节，后面 handle() 还能从头读请求行。
+    ★ 拿不到就返回 False（当 HTTP 处理）—— 宁可走老路也别把连接挂死。
+    """
+    try:
+        head = client.recv(1, socket.MSG_PEEK)
+    except Exception:
+        return False
+    return head[:1] == b'\x16'
+
+
+def serve_one(client, addr):
+    """把一条 TCP 连接按协议分派给 handle()。
+
+    ★ 这是 accept 之后唯一的分流点 ★
+      · HTTPS → 先 TLS 握手，再把手握后的 socket 交给 handle（上层无需知情）
+      · HTTP  → 原样交给 handle（行为与以前一字不差）
+    """
+    ctx = _build_tls_context() if TLS_ENABLED else None
+    if ctx is not None and _is_tls_client_hello(client):
+        try:
+            tls = ctx.wrap_socket(client, server_side=True)
+        except Exception as exc:
+            # 握手失败最常见的原因是"客户端不信任自签证书直接断开"，
+            # 这属于预期内，记一句就够，别刷屏
+            log('TLS 握手失败（%s）：%s' % (addr[0] if addr else '?', exc))
+            try:
+                client.close()
+            except Exception:
+                pass
+            return
+        try:
+            handle(tls, addr)
+        finally:
+            try:
+                tls.close()
+            except Exception:
+                pass
+        return
+    handle(client, addr)
+
+
 # ── 主循环 ────────────────────────────────────────────────────────
 def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1451,6 +1575,12 @@ def main():
            DOCS_HOST, DOCS_PORT,
            b','.join(_DOCS_ROOT_PREFIXES).decode('latin-1')))
 
+    # ★ 提前建一次上下文：证书有问题要在这里就暴露（写进启动日志），
+    #   而不是等第一个 HTTPS 请求进来才发现。
+    log('协议模式：%s'
+        % ('HTTP+HTTPS 共用端口（证书 %s）' % TLS_CERT
+           if _build_tls_context() else '纯 HTTP（未配置 PROXY_TLS_CERT/KEY）'))
+
     while True:
         try:
             client, addr = srv.accept()
@@ -1460,7 +1590,9 @@ def main():
             log('accept 异常：%s' % exc)
             time.sleep(0.2)
             continue
-        threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+        # ★ 走 serve_one 而不是 handle：它按首字节嗅探把 HTTPS 与 HTTP 分流，
+        #   纯 HTTP 客户端的行为与改造前完全一致（serve_one 内直接转 handle）。
+        threading.Thread(target=serve_one, args=(client, addr), daemon=True).start()
     return 0
 
 
