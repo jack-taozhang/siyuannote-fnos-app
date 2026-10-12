@@ -1,0 +1,28 @@
+#!/bin/bash
+#
+# 用户在应用设置里点「保存」之前调用 —— 只记录，不主动停服务。
+#
+# 为什么必须有这一对（config_init / config_callback）：
+#   飞牛在应用设置变更时会先停掉应用（避免旧进程还拿着旧的环境变量），
+#   而它自己不保证再启动。没有回调负责拉起时，用户看到的就是
+#   "改完设置，应用莫名其妙变成已停用"。
+#   分工：init 只打日志，callback 负责重启。
+
+PKGVAR="${TRIM_PKGVAR:-/tmp/${TRIM_APPNAME:-siyuannote}}"
+PKGETC="${TRIM_PKGETC:-${PKGVAR}}"
+LOG_FILE="${PKGVAR}/app.log"
+
+mkdir -p "$PKGVAR" 2>/dev/null
+touch "$LOG_FILE" 2>/dev/null
+
+{
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [config_init] 设置即将变更"
+  echo "  服务端口=${TRIM_SERVICE_PORT:-<未声明>}"
+  for f in workspace.path authcode run-as; do
+    if [ -f "${PKGETC}/${f}" ]; then
+      echo "  ${f}=$(head -n 1 "${PKGETC}/${f}" 2>/dev/null)"
+    fi
+  done
+} >> "$LOG_FILE" 2>/dev/null
+
+exit 0
