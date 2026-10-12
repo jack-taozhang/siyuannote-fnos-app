@@ -1,5 +1,5 @@
 appname=siyuannote
-version=2.2.1
+version=2.2.2
 display_name=思源笔记
 desc=在飞牛上<b>原生运行</b>思源笔记（内核 3.8.6），不依赖 Docker，随系统自启、由应用中心统管启停。<br>桌面图标点一下就在飞牛桌面窗口内打开。<br>数据仍是你现在的工作区，一个字节都不动。
 source=thirdparty
