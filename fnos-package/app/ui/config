@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "siyuannote.main": {
+      "title": "思源笔记",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "http",
+      "port": "6806",
+      "url": "/stage/build/desktop",
+      "allUsers": true
+    }
+  }
+}
