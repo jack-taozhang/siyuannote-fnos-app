@@ -7,7 +7,7 @@
 
 ## 1. 上游：思源内核
 
-- **当前锁定：`3.8.6`**（Linux x86_64 Go 二进制，约 132 MB）
+- **当前锁定：`3.8.7`**（Linux x86_64 Go 二进制，约 132 MB）
 - 上游：<https://github.com/siyuan-note/siyuan>
 - 许可：AGPL-3.0（**分发时必须保留其许可声明**）
 
@@ -75,9 +75,9 @@ loader --library-path <dir> kernel
 
 | 文件 | 字段 | 当前 |
 |---|---|---|
-| `fnos-package/manifest` | `version` | 2.2.1 |
+| `fnos-package/manifest` | `version` | 2.2.3 |
 | `fnos-package/manifest` | `changelog` | 见文件 |
-| （若已发版）GitHub Release tag | `v2.2.1` | |
+| （若已发版）GitHub Release tag | `v2.2.3` | |
 
 ★ `manifest` 是 **INI 格式，值里不能出现 `;` 或 `#`**，会被当注释截断
 （`changelog` 最容易踩）。`build-fpk.sh` 会在打包前拦下这类错误。
