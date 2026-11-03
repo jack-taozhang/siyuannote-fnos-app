@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# 把桌面图标的「打开方式」改成 url 型 —— 点一下用**浏览器新标签页**打开，
+# 不再嵌在飞牛桌面窗口里（iframe）。
+#
+# ─────────────────────────────────────────────────────────────────────
+# 为什么必须改库，改 app/ui/config 没用（2026-11-03 实测）
+# ─────────────────────────────────────────────────────────────────────
+# 应用中心给**第三方包**建服务时，`type` 硬编码成 iframe，**完全不读**
+# `app/ui/config` 里写的 `"type"`。证据：
+#   · 文件里写着 `"type": "url"` 时，查库仍是 iframe
+#     （`trim_sac.entry.open_type=iframe`、`appcenter.app_service.type=iframe`）；
+#   · `/usr/trim/bin/trim_app_center` 全二进制里没有 `url` 这个类型常量，
+#     iframe 只作为与 hidden/kernel/docker 并列的字面量出现。
+# 所以想让图标变成浏览器打开，只能自己改库。
+#
+# 决定行为的是两张库：
+#   · `appcenter.app_service.type`  —— 应用中心的「服务」类型
+#   · `trim_sac.entry.open_type`    —— 飞牛前端入口分发（桌面图标读这个）
+# 前端逻辑（`/usr/trim/www/assets/index-*.js`）：
+#     type === 'url'    ⇒ window.open(url, '_blank')，**不占**桌面窗口
+#     type === 'iframe' ⇒ 嵌在桌面窗口里
+#
+# ⚠️ 与 `fnos-dwg-viewer` 同名脚本的差别：那边顺手删掉了桌面图标
+#    （它是给文件关联用的，不需要图标）。**思源要保留图标**，只改打开方式，
+#    所以这里既不 DELETE entry，也不动 `user_desktop_entry.is_deleted`。
+#
+# 幂等：重复执行结果一样。改不到只打日志、不报错 —— 宁可少一个体验优化，
+# 也不能让安装整体失败。
+# ─────────────────────────────────────────────────────────────────────
+
+set -u
+
+APP_NAME="${TRIM_APPNAME:-siyuannote}"
+PKGVAR="${TRIM_PKGVAR:-/tmp/${APP_NAME}}"
+LOG_FILE="$PKGVAR/app.log"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - [fix-open-type] $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+mkdir -p "$PKGVAR" 2>/dev/null
+touch "$LOG_FILE" 2>/dev/null
+
+# psql 不在 PATH 里（它在 postgres 的家目录下），给绝对路径
+PSQL=""
+for c in /usr/bin/psql /usr/lib/postgresql/*/bin/psql /usr/local/pgsql/bin/psql; do
+  if [ -x "$c" ]; then PSQL="$c"; break; fi
+done
+
+if [ -z "$PSQL" ]; then
+  log_msg "找不到 psql，跳过打开方式修正（不影响应用本身）"
+  exit 0
+fi
+
+SQL_FILE="$(mktemp /tmp/${APP_NAME}-fix-XXXXXX.sql 2>/dev/null || echo /tmp/${APP_NAME}-fix.sql)"
+[ -n "$SQL_FILE" ] || { log_msg "建不了临时 SQL 文件，跳过"; exit 0; }
+# SQL 以 postgres 身份执行，root 建的 600 文件它读不到
+chmod 644 "$SQL_FILE" 2>/dev/null
+
+# ── appcenter：app_service.type = url ──
+# ⚠️ app_service.app_id 是 bigint 外键指向 app.id，**不是应用名**，
+#    拿名字去比会报 invalid input syntax for type bigint。
+cat > "$SQL_FILE" <<SQL
+BEGIN;
+UPDATE app_service SET type = 'url', updated_at = now()
+ WHERE app_id = (SELECT id FROM app WHERE app_name = '${APP_NAME}');
+COMMIT;
+SQL
+
+if su - postgres -c "$PSQL -q -d appcenter -f '$SQL_FILE'" >/dev/null 2>&1; then
+  log_msg "appcenter：服务类型已改为 url（浏览器打开）"
+else
+  log_msg "⚠ appcenter 修正失败（库结构可能已变），跳过"
+fi
+
+# ── trim_sac：entry.open_type = url（图标保留）──
+cat > "$SQL_FILE" <<SQL
+BEGIN;
+UPDATE entry SET open_type = 'url', updated_at = now()
+ WHERE app_name = '${APP_NAME}';
+COMMIT;
+SQL
+
+if su - postgres -c "$PSQL -q -d trim_sac -f '$SQL_FILE'" >/dev/null 2>&1; then
+  log_msg "trim_sac：入口已改为 url 型（桌面图标保留）"
+else
+  log_msg "⚠ trim_sac 修正失败（sac 库结构可能已变），跳过"
+fi
+
+rm -f "$SQL_FILE" 2>/dev/null
+exit 0
