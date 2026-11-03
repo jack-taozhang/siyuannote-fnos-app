@@ -14,6 +14,14 @@ log_msg() {
 
 mkdir -p "$PKGVAR" 2>/dev/null
 
+# 升级是「从 iframe 型过来」的必经路径：重装后应用中心会把服务类型重新建成
+# iframe，所以每次升级都要再修正一次打开方式，否则升上来又嵌回桌面窗口。
+FIX=""
+for cand in "${TRIM_APPDEST}/cmd/fix-open-type" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/fix-open-type"; do
+  if [ -x "$cand" ]; then FIX="$cand"; break; fi
+done
+[ -n "$FIX" ] && "$FIX" >> "${PKGVAR}/app.log" 2>&1
+
 # 同上：cmd/ 在 /var/apps/<app>/cmd/，不在 TRIM_APPDEST 下
 MAIN=""
 for cand in "${TRIM_APPDEST}/cmd/main" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/main"; do
