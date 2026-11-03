@@ -7,7 +7,7 @@
 
 ## 1. 上游：思源内核
 
-- **当前锁定：`3.8.7`**（Linux x86_64 Go 二进制，约 132 MB）
+- **当前锁定：`3.8.9`**（Linux x86_64 Go 二进制，约 151 MB）
 - 上游：<https://github.com/siyuan-note/siyuan>
 - 许可：AGPL-3.0（**分发时必须保留其许可声明**）
 
@@ -75,12 +75,52 @@ loader --library-path <dir> kernel
 
 | 文件 | 字段 | 当前 |
 |---|---|---|
-| `fnos-package/manifest` | `version` | 2.2.3 |
+| `fnos-package/manifest` | `version` | 3.8.9 |
 | `fnos-package/manifest` | `changelog` | 见文件 |
-| （若已发版）GitHub Release tag | `v2.2.3` | |
+| （若已发版）GitHub Release tag | `v3.8.9` | |
+
+★ **应用版本号 = 上游内核版本号**（与 `fnos-dwg-viewer` / `fnos-file-viewer` 同一约定）。
+`2.2.3` 是旧的自定编号，从内核 3.8.8 起改成跟内核走 —— 以前看「应用版本 2.2.3」
+还得在脑子里换算成「内核几点几」，出问题时对不上号。`changelog` 里保留了
+全部 2.x 的历史条目，不要删。
 
 ★ `manifest` 是 **INI 格式，值里不能出现 `;` 或 `#`**，会被当注释截断
 （`changelog` 最容易踩）。`build-fpk.sh` 会在打包前拦下这类错误。
+
+### 桌面入口 / 打开方式（`app/ui/config` + `cmd/fix-open-type`）
+
+```json
+{ ".url": { "siyuannote.main": {
+    "type": "url", "port": "6806", "url": "/stage/build/desktop" } } }
+```
+
+**要的行为：桌面图标点一下用浏览器新标签页打开，不嵌在飞牛桌面窗口里。**
+
+★ **`type` 对第三方包无效**（2026-11-03 实测）：应用中心给第三方包建服务时
+`type` 只认 `iframe`，**完全不读**这里写的 `"url"`。证据——
+
+- 文件里写着 `"type": "url"` 时，查库仍是 `iframe`；
+- `/usr/trim/bin/trim_app_center` 全二进制里没有 `"url"` 这个类型常量，
+  `iframe` 只作为与 hidden/kernel/docker 并列的字面量出现。
+
+⇒ 所以真正生效的是 **`cmd/fix-open-type`**（照抄 `fnos-dwg-viewer` 的同名脚本），
+它改两张库：
+
+| 库 | 表 / 字段 | 作用 |
+|---|---|---|
+| `appcenter` | `app_service.type` | 应用中心的「服务」类型 |
+| `trim_sac` | `entry.open_type` | 飞牛前端入口分发（桌面图标读这个） |
+
+前端逻辑（`/usr/trim/www/assets/index-*.js`）：`url` ⇒ `window.open(…,'_blank')`，
+不占桌面窗口；`iframe` ⇒ 嵌在桌面窗口里。
+
+★ **每次重装/升级都会退回 iframe**（应用中心重建服务行），所以该脚本挂在
+`install_callback` / `upgrade_callback` / `config_callback` 三处，幂等、失败不阻断安装。
+
+★ 与 `fnos-dwg-viewer` 版本的差别：那边顺手删了桌面图标（它是给文件关联用的）；
+思源**保留图标**，只改打开方式 —— 所以不 `DELETE entry`、不动 `is_deleted`。
+
+`port` / `url` 仍然有效：它决定应用中心建服务时指向哪个端口和路径。
 
 ### `build-fpk.sh` 会预检的错误
 
