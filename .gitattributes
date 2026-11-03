@@ -15,6 +15,12 @@ fnos-package/cmd/main       text eol=lf
 fnos-package/app/launch-kernel.sh   text eol=lf
 fnos-package/app/*.py               text eol=lf
 
+# 应用中心读的配置：manifest 是 INI、config/* 是 key=value
+# 仓库里存成 LF 更稳妥（虽然 appcenter 对 \r 是宽容的，但没必要冒险）
+fnos-package/manifest   text eol=lf
+fnos-package/config/*   text eol=lf
+fnos-package/app/ui/config  text eol=lf
+
 # 仓库内的运维脚本
 tools/*.sh   text eol=lf
 scripts/*.sh text eol=lf
