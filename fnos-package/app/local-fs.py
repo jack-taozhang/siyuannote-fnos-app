@@ -26,7 +26,8 @@
   ⚠️ 本服务**曾经内置**一个 DWG 查看器（cad-viewer 1.7.4 的构建产物，
      app/local-fs-dist/，22MB）。2026-10-10 已连同它的静态服务、资源前缀改写
      机制一并删除 —— CAD 预览改成与「文件预览」完全同构地借用原生应用。
-     ⇒ **本服务现在只提供 /api/* 和一个同源同步页 /cred-sync，根路径一律 404。**
+     ⇒ **本服务现在只提供 /api/*、一个同源同步页 /cred-sync，
+       以及直连根路径时的一张静态导航页（2026-11-01 加）。**
        别再把查看器页面挂回来（`do_GET` 的兜底分支里留了这条说明）。
 
 ★ 它与前端的历史契约（照抄 cad-viewer，现在仍被思源插件使用）★
@@ -87,6 +88,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import html as html_mod
 import json
 import mimetypes
 import os
@@ -136,6 +138,15 @@ EXPLICIT_ROOTS = [p for p in (os.environ.get("LOCAL_FS_ROOTS") or "").split(",")
 # ★ 为什么要有②：手机经外网穿透（FN Connect）访问时只映射了 6806，
 #   浏览器根本够不到 8021 —— 走同源通道才能用。
 BASE_PREFIX = (os.environ.get("LOCAL_FS_BASE") or "/localfs").rstrip("/")
+
+# 落地页（访问根路径 `/` 时给的那一页导航）要展示的「同机其他入口」端口。
+# ★ 只用于渲染 HTML，不参与任何接口逻辑 ★ 端口改了就用环境变量覆盖，
+#   别为了改个链接去动 reverse-proxy.py。
+LANDING_PORTS = {
+    "siyuan": int(os.environ.get("LOCAL_FS_SIYUAN_PORT") or "6806"),   # 思源本体（反代）
+    "cad": int(os.environ.get("LOCAL_FS_CAD_PORT") or "8020"),         # 飞牛「CAD 看图」
+    "files": int(os.environ.get("LOCAL_FS_VIEWER_PORT") or "8030"),    # 飞牛「文件预览」
+}
 
 # OnlyOffice 的临时下载地址可能给的是容器内名的，取文件时要放宽校验
 FETCH_TIMEOUT = float(os.environ.get("LOCAL_FS_FETCH_TIMEOUT") or "600")
@@ -1388,6 +1399,220 @@ def handle_oo_callback(abs_path: str, body: bytes) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 根路径落地页
+# ---------------------------------------------------------------------------
+# ★ 为什么要这一页 ★
+#   本服务的定位是「数据面」，本来只该有 /api/*。但用户直接浏览器打开
+#   http://<nas>:8021/ 时，看到的是一屏 JSON 报错（NO_PAGE），第一反应是
+#   "服务坏了"。这一页只是**导航**：告诉人这里是什么、该去哪个端口，
+#   不给任何文件内容、不挂任何查看器（2026-10-10 拆掉内置查看器的决定不变）。
+#   ⇒ 因此页面里全是静态链接，零文件数据，零鉴权影响。
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本机文件服务 · 思源笔记</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#f6f7f9;color:#1b1f24;
+font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{width:100%;max-width:560px;padding:32px 24px}
+h1{font-size:19px;font-weight:600;margin:0 0 8px}
+.sub{margin:0 0 22px;color:#5c6773;font-size:13px}
+.sub code{font-family:ui-monospace,Consolas,monospace;background:#eef0f3;border-radius:4px;padding:1px 5px}
+a.card{display:flex;align-items:center;justify-content:space-between;gap:12px;
+text-decoration:none;color:inherit;background:#fff;border:1px solid #e3e6ea;
+border-radius:12px;padding:14px 16px;margin-bottom:10px}
+a.card:hover{border-color:#c9ced6;background:#fbfcfd}
+.t{font-weight:600;font-size:14px}
+.d{color:#5c6773;font-size:12px;margin-top:2px}
+.port{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#5c6773;
+background:#f1f3f5;border-radius:6px;padding:3px 8px;white-space:nowrap}
+.foot{margin-top:22px;font-size:12px;color:#78838f;line-height:1.9}
+.foot code{font-family:ui-monospace,Consolas,monospace}
+@media(prefers-color-scheme:dark){
+body{background:#16191d;color:#e6e9ed}
+.sub,.d,.foot{color:#9aa4b0}
+.sub code{background:#272d36}
+a.card{background:#1e2229;border-color:#2c323b}
+a.card:hover{background:#232830;border-color:#3a424e}
+.port{background:#272d36;color:#9aa4b0}}
+</style></head><body><div class="wrap">
+<h1>本机文件服务</h1>
+<p class="sub">这是思源笔记的接口后端（<code>/api/*</code>），本身不渲染文件。
+要浏览或预览文件，请从下面的入口进 —— 它们是同一台 NAS 上的原生应用。</p>
+<a class="card" href="//{host}:{siyuan}/">
+<div><div class="t">思源笔记</div><div class="d">笔记本体 · 「本机存储」从这里浏览全盘</div></div>
+<span class="port">:{siyuan}</span></a>
+<a class="card" href="//{host}:{cad}/">
+<div><div class="t">CAD 看图</div><div class="d">DWG / DXF 图纸预览</div></div>
+<span class="port">:{cad}</span></a>
+<a class="card" href="//{host}:{files}/">
+<div><div class="t">文件预览</div><div class="d">PDF / Office / 图片 / 视频</div></div>
+<span class="port">:{files}</span></a>
+<div class="foot">接口自检：<a href="/api/health">/api/health</a> ·
+<a href="/api/doctor">/api/doctor</a><br>
+经思源同源通道访问时，路径前缀为 <code>/localfs/</code></div>
+</div></body></html>
+"""
+
+
+def split_host(host_header: str):
+    """把 Host 头拆成 (主机名, 端口字符串)。`[::1]:8021` 这种 IPv6 也要对。"""
+    h = (host_header or "").strip()
+    if h.startswith("//"):
+        h = h[2:]
+    if not h:
+        return "", ""
+    if h.startswith("["):
+        end = h.find("]")
+        if end > 0:
+            rest = h[end + 1:]
+            return h[:end + 1], (rest[1:] if rest.startswith(":") else "")
+        return h, ""
+    if ":" in h:
+        name, _, port = h.rpartition(":")
+        return name, port
+    return h, ""
+
+
+def landing_html(host: str) -> str:
+    return (LANDING_HTML
+            .replace("{host}", host or "localhost")
+            .replace("{siyuan}", str(LANDING_PORTS["siyuan"]))
+            .replace("{cad}", str(LANDING_PORTS["cad"]))
+            .replace("{files}", str(LANDING_PORTS["files"])))
+
+
+# ---------------------------------------------------------------------------
+# 自检结果的「人看版」页面（/api/health、/api/doctor 被浏览器打开时用）
+# ---------------------------------------------------------------------------
+# ★ 为什么要有它 ★
+#   这两个是接口，程序调用要的是 JSON；但用户会直接在地址栏敲它们看服务活着没。
+#   一屏 JSON 对人不友好，所以**按 Accept 头分流**：
+#     Accept 含 text/html（浏览器导航）→ 渲染成这张卡片页；
+#     其余（插件 fetch、curl、脚本）            → 原样 JSON，契约一字不改。
+#   页面底部保留「原始 JSON」折叠块，排查时仍能拿到全量字段。
+_DIAG_LABELS = {
+    "app": "应用",
+    "version": "版本",
+    "oo": "OnlyOffice 已配置",
+    "roots": "存储空间",
+    "allowedRoots": "允许的根目录",
+    "uid": "运行 UID",
+    "runsAsRoot": "以 root 运行",
+    "port": "端口",
+}
+
+DIAG_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} · 本机文件服务</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;
+background:#f6f7f9;color:#1b1f24;
+font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{width:100%;max-width:560px;padding:40px 24px}
+h1{font-size:19px;font-weight:600;margin:0 0 4px}
+.sub{margin:0 0 18px;color:#5c6773;font-size:13px}
+.badge{display:inline-flex;align-items:center;gap:7px;border-radius:999px;
+padding:5px 12px;font-size:13px;font-weight:600;margin-bottom:18px}
+.badge.ok{background:#e1f5ee;color:#0f6e56}
+.badge.bad{background:#fcebeb;color:#a32d2d}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.card{background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:4px 16px}
+.row{display:flex;justify-content:space-between;gap:16px;padding:10px 0;
+border-bottom:1px solid #eef0f3;font-size:13.5px}
+.row:last-child{border-bottom:0}
+.k{color:#5c6773;white-space:nowrap}
+.v{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;
+text-align:right;word-break:break-all}
+.sec{margin:22px 0 8px;font-size:13px;font-weight:600;color:#5c6773}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e6ea;
+border-radius:12px;overflow:hidden;font-size:13px}
+th{text-align:left;font-weight:500;color:#5c6773;background:#fafbfc;padding:9px 12px;font-size:12px}
+td{padding:9px 12px;border-top:1px solid #eef0f3}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+.pill{border-radius:999px;padding:2px 9px;font-size:12px;white-space:nowrap}
+.pill.ok{background:#e1f5ee;color:#0f6e56}
+.pill.bad{background:#fcebeb;color:#a32d2d}
+details{margin-top:22px}
+summary{cursor:pointer;color:#5c6773;font-size:13px}
+pre{margin:10px 0 0;padding:14px;background:#fff;border:1px solid #e3e6ea;border-radius:12px;
+overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.55}
+.foot{margin-top:20px;font-size:12px;color:#78838f}
+.foot a{color:inherit}
+@media(prefers-color-scheme:dark){
+body{background:#16191d;color:#e6e9ed}
+.sub,.k,.sec,.foot{color:#9aa4b0}
+.v{color:#c8cfd8}
+.badge.ok,.pill.ok{background:#0d3b32;color:#5dcaa5}
+.badge.bad,.pill.bad{background:#3f1d1d;color:#f09595}
+.card,table,pre{background:#1e2229;border-color:#2c323b}
+th{background:#232830;color:#9aa4b0}
+td,.row{border-color:#2c323b}
+summary{color:#9aa4b0}}
+</style></head><body><div class="wrap">
+<h1>{title}</h1>
+<p class="sub">思源笔记 · 本机文件服务（接口 {path}）</p>
+<div class="badge {cls}"><span class="dot"></span>{label}</div>
+<div class="card">{rows}</div>
+{detail}
+<details><summary>原始 JSON</summary><pre>{raw}</pre></details>
+<div class="foot"><a href="/">返回导航页</a> · <a href="">刷新</a>
+&nbsp;·&nbsp; 程序调用请加 <code>Accept: application/json</code> 直接取 JSON</div>
+</div></body></html>
+"""
+
+
+def _diag_value(v) -> str:
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if v is None:
+        return "—"
+    if isinstance(v, (list, tuple)):
+        return "、".join(str(x) for x in v) if v else "（空）"
+    return str(v)
+
+
+def diag_html(title: str, path: str, payload: dict) -> str:
+    ok = bool(payload.get("ok"))
+    rows = []
+    for k, v in payload.items():
+        if k in ("ok", "rootsDetail"):
+            continue
+        rows.append('<div class="row"><span class="k">%s</span><span class="v">%s</span></div>'
+                    % (html_mod.escape(_DIAG_LABELS.get(k, k)),
+                       html_mod.escape(_diag_value(v))))
+
+    detail = ""
+    det = payload.get("rootsDetail")
+    if isinstance(det, list) and det:
+        trs = []
+        for it in det:
+            if not isinstance(it, dict):
+                continue
+            flag = ('<span class="pill ok">可读</span>' if it.get("readable")
+                    else '<span class="pill bad">不可读</span>')
+            trs.append('<tr><td class="mono">%s</td><td>%s</td><td>%s</td></tr>'
+                       % (html_mod.escape(_diag_value(it.get("path", ""))),
+                          html_mod.escape(_diag_value(it.get("label", ""))), flag))
+        detail = ('<div class="sec">存储空间</div><table><thead><tr>'
+                  '<th>路径</th><th>名称</th><th>状态</th></tr></thead>'
+                  '<tbody>%s</tbody></table>' % "".join(trs))
+
+    return (DIAG_HTML
+            .replace("{title}", html_mod.escape(title))
+            .replace("{path}", html_mod.escape(path))
+            .replace("{cls}", "ok" if ok else "bad")
+            .replace("{label}", "正常" if ok else "异常")
+            .replace("{rows}", "".join(rows))
+            .replace("{detail}", detail)
+            .replace("{raw}", html_mod.escape(json.dumps(payload, ensure_ascii=False, indent=2))))
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -1397,6 +1622,16 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 基础工具 -------------------------------------------------------
     def log_message(self, fmt, *args):  # 压掉默认的逐请求日志（太吵）
         pass
+
+    def _wants_html(self) -> bool:
+        """这次请求是不是「人在浏览器里打开」，而不是程序在调接口。
+
+        ★ 判据只认 Accept 头，不认 Host/端口：/api/health 既可能直连 :8021，
+          也可能经思源反代 :6806/localfs 打开，两种都该给页面。
+          插件 fetch / curl / 脚本一般发 `*/*` 或 `application/json`，
+          不含 text/html ⇒ 仍拿原始 JSON，接口契约一个字都不变。
+        """
+        return "text/html" in (self.headers.get("Accept") or "").lower()
 
     def _cors(self):
         origin = self.headers.get("Origin") or "*"
@@ -1500,10 +1735,14 @@ class Handler(BaseHTTPRequestHandler):
                 return v[0] if v else default
 
             if pathname in ("/health", "/api/health"):
-                return self._json(200, {
+                payload = {
                     "ok": True, "app": APP_ID, "version": APP_VERSION,
                     "oo": bool(OO_URL), "roots": allowed_roots(),
-                })
+                }
+                # 浏览器地址栏打开 → 好看的自检页；程序调用 → 原样 JSON
+                if self._wants_html():
+                    return self._html(diag_html("健康检查", pathname, payload))
+                return self._json(200, payload)
 
             if pathname == "/api/config":
                 roots = allowed_roots()
@@ -1528,7 +1767,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if pathname == "/api/doctor":
                 roots = allowed_roots()
-                return self._json(200, {
+                payload = {
                     "ok": True,
                     "app": APP_ID,
                     "version": APP_VERSION,
@@ -1539,7 +1778,10 @@ class Handler(BaseHTTPRequestHandler):
                         {"path": to_client_path(r), "label": root_label(r), "readable": can_read(r)}
                         for r in roots
                     ],
-                })
+                }
+                if self._wants_html():
+                    return self._html(diag_html("权限自检", pathname, payload))
+                return self._json(200, payload)
 
             # 「有没有配 WebDAV 数据源」的探询。本服务只有本机存储，明确回
             # 「没配」—— 留着是为了兼容性（老版本内置查看器、以及任何沿用
@@ -1628,6 +1870,15 @@ class Handler(BaseHTTPRequestHandler):
             if pathname == "/cred-sync":
                 return self._html(CRED_SYNC_HTML)
 
+            # ★ 根路径落地页（2026-11-01 新增）★
+            #   只在**直连本服务端口**时给这一页。经思源反代（:6806/localfs/）
+            #   进来的根路径仍然是原样的 404 —— 同源通道里没有"页面"这个语义，
+            #   而且历史上正是因为在这儿挂过页面才把排查带偏过。
+            if pathname in ("/", "/index.html"):
+                host_name, host_port = split_host(self.headers.get("Host", ""))
+                if host_port == str(PORT):
+                    return self._html(landing_html(host_name))
+
             # ★ 本服务只提供 API（外加一个 /cred-sync 同步页），没有别的页面 ★
             #   这里曾经是"内置 DWG 查看器前端 + SPA 兜底"。2026-10-10 起
             #   CAD 预览改为**借用飞牛原生「CAD 看图」应用**
@@ -1636,6 +1887,8 @@ class Handler(BaseHTTPRequestHandler):
             #   22MB 产物（app/local-fs-dist/）一起删掉了，别再把页面挂回来。
             #   留着这条 404 是为了让"误敲根路径"的人一眼看懂：
             #   服务在跑（有响应），只是这里本来就不提供页面。
+            #   （根路径的直连访问已在上面的 landing_html 分支里给了导航页；
+            #    走到这里的是 /localfs/ 这类同源通道或其它未知路径。）
             raise ApiError(404, "NO_PAGE",
                            "本服务只提供接口（/api/*）。\n"
                            "图纸预览请用飞牛原生「CAD 看图」应用，或经 /localfs/cad/ 访问。")
