@@ -15,6 +15,13 @@ log_msg() {
 mkdir -p "$PKGVAR" 2>/dev/null
 touch "$LOG_FILE" 2>/dev/null
 
+# 顺手把打开方式再校一次（用户在设置里保存时最容易发现图标行为不对）。
+FIX=""
+for cand in "${TRIM_APPDEST}/cmd/fix-open-type" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/fix-open-type"; do
+  if [ -x "$cand" ]; then FIX="$cand"; break; fi
+done
+[ -n "$FIX" ] && "$FIX" >> "$LOG_FILE" 2>&1
+
 # 同上：cmd/ 在 /var/apps/<app>/cmd/，不在 TRIM_APPDEST 下
 MAIN=""
 for cand in "${TRIM_APPDEST}/cmd/main" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/main"; do
