@@ -43,19 +43,23 @@ if ! command -v fnpack >/dev/null 2>&1; then
   echo "  手工 tar 打的包缺 cmd/ 脚本与 app.tgz，安装时会被判「不符合系统要求」。"
   exit 1
 fi
-if ! command -v docker >/dev/null 2>&1; then
-  echo "✗ 找不到 docker"
-  exit 1
-fi
-if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
-  echo "✗ 容器 ${CONTAINER} 不存在。"
-  echo "  可先用 SIYUAN_CONTAINER=<名字> 指定别的容器（docker ps -a 看名字）。"
-  exit 1
-fi
 
 # ── 1. 提取运行期（内核 + 前端资源 + musl） ────────────────────
 # 注：容器不需要在运行状态，docker cp 对已停止的容器同样有效。
+# ★ docker 与容器只在**真的要提取**时才需要检查 ★
+#   以前这两个检查在 0 段里无条件执行，结果 kernel-dist 明明已经在、
+#   只是机器上没留容器（迁到原生应用后会清掉），增量打包也直接被拒。
 if [ "$REFRESH" = "1" ] || [ ! -f "${RUNTIME}/kernel" ]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "✗ 找不到 docker（需要它从镜像/容器里提取内核）"
+    exit 1
+  fi
+  if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    echo "✗ 容器 ${CONTAINER} 不存在。"
+    echo "  可先用 SIYUAN_CONTAINER=<名字> 指定别的容器（docker ps -a 看名字），"
+    echo "  或直接放一份 kernel-dist/ 进去（有这个目录就不需要容器）。"
+    exit 1
+  fi
   echo "[1/5] 从容器提取内核与前端资源 → app/kernel-dist/"
   rm -rf "$RUNTIME"
   mkdir -p "$RUNTIME"
