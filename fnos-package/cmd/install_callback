@@ -41,6 +41,20 @@ if [ -n "$missing" ]; then
   echo "思源笔记安装不完整，缺少：${missing}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null
 fi
 
+# 把「打开方式」改成 url 型：桌面图标点一下用浏览器新标签页打开，
+# 不嵌在飞牛桌面窗口里。应用中心给第三方包只会建 iframe 型服务（硬编码），
+# 装完必须自己改库，否则图标的打开方式永远是桌面窗口内嵌。
+# 详见 cmd/fix-open-type 头部注释。失败不影响安装。
+FIX=""
+for cand in "${TRIM_APPDEST}/cmd/fix-open-type" "/var/apps/${TRIM_APPNAME:-siyuannote}/cmd/fix-open-type"; do
+  if [ -x "$cand" ]; then FIX="$cand"; break; fi
+done
+if [ -n "$FIX" ]; then
+  "$FIX" >> "$LOG_FILE" 2>&1
+else
+  log_msg "未找到 cmd/fix-open-type，跳过打开方式修正"
+fi
+
 # cmd/ 不在 TRIM_APPDEST 下 —— 飞牛把包里的 cmd/ 放到 /var/apps/<app>/cmd/，
 # 而 TRIM_APPDEST 指向的是 payload（kernel-dist、launch-kernel.sh 那一层）。
 # 两个位置都试一下，免得"装完不会自启"这种哑巴故障。
